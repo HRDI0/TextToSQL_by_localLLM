@@ -1,0 +1,91 @@
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+htmlcov/
+
+# Streamlit and local app state
+.streamlit/
+!.streamlit/config.example.toml
+.streamlit/secrets.toml
+
+# Local runtime byproducts
+nohup.out
+*.pid
+*.log
+*.jsonl
+tmp/
+temp/
+.cache/
+
+# Local Docker Compose configuration
+compose.yaml
+compose.yml
+!compose.example.yaml
+!compose.example.yml
+
+# Project-local agent/tool state
+.sisyphus/
+.playwright-mcp/
+AGENTS.md
+**/AGENTS.md
+
+# Internal/confidential documentation
+docs/**
+!docs/
+!docs/public/
+!docs/public/**
+test/*.md
+test/**/*result*.md
+
+# Internal database schema and migration files
+migrations/
+
+# Raw data, archives, and generated local assets
+data/raw*/
+data/private/
+data/internal/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+db_backups/
+logs/
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# Local third-party checkouts/build outputs
+llama.cpp/
+
+# Databases and dumps generated outside migrations
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

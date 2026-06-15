@@ -1,0 +1,3 @@
+# Install all root project runtime dependencies.
+-r requirements-langgraph.txt
+-r requirements-mariadb.txt

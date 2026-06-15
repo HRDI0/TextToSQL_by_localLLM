@@ -1,0 +1,9 @@
+# Workflow, Streamlit UI, and local OpenAI-compatible LLM client.
+# Versions mirror the checked uv-managed .venv on Python 3.12.3.
+langgraph==1.2.5
+streamlit==1.58.0
+PyMySQL==1.2.0
+typing-extensions==4.15.0
+python-dotenv==1.2.2
+langchain-openai==1.3.2
+llama-cpp-python[server]==0.3.29
