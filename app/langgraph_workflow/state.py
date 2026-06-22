@@ -13,19 +13,23 @@ PREDICATE_SQL_TYPES = {"UPDATE", "DELETE"}
 DANGEROUS_SQL_TOKENS = (";", "--", "/*", "*/")
 PROTECTED_WRITE_COLUMNS = {"source_channel", "날짜", "세션 소스/매체", "세션 캠페인", "캠페인", "광고 그룹"}
 
-def env_value(name: str, default: str) -> str:
-    return os.environ.get(name) or default
+def env_value(name: str, default: str, *fallback_names: str) -> str:
+    for candidate in (name, *fallback_names):
+        value = os.environ.get(candidate)
+        if value:
+            return value
+    return default
 
 
 def env_int(name: str, default: int) -> int:
     return int(env_value(name, str(default)))
 
 
-DEFAULT_DB_HOST = env_value("SQL_WORKFLOW_DB_HOST", "127.0.0.1")
-DEFAULT_DB_PORT = env_int("SQL_WORKFLOW_DB_PORT", 3307)
-DEFAULT_DB_USER = env_value("SQL_WORKFLOW_DB_USER", "workflow_user")
-DEFAULT_DB_PASSWORD = env_value("SQL_WORKFLOW_DB_PASSWORD", "")
-DEFAULT_DB_NAME = env_value("SQL_WORKFLOW_DB_NAME", "approval_workflow")
+DEFAULT_DB_HOST = env_value("SQL_WORKFLOW_DB_HOST", "127.0.0.1", "KTM_DB_HOST")
+DEFAULT_DB_PORT = int(env_value("SQL_WORKFLOW_DB_PORT", "3307", "KTM_DB_PORT"))
+DEFAULT_DB_USER = env_value("SQL_WORKFLOW_DB_USER", "workflow_user", "KTM_DB_USER")
+DEFAULT_DB_PASSWORD = env_value("SQL_WORKFLOW_DB_PASSWORD", "", "KTM_DB_PASSWORD")
+DEFAULT_DB_NAME = env_value("SQL_WORKFLOW_DB_NAME", "approval_workflow", "KTM_DB_NAME")
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,8 @@ class ModificationWorkflowState(TypedDict, total=False):
     column_alias_mappings: list[dict[str, Any]]
     metric_definitions: list[dict[str, Any]]
     protected_column_policies: list[dict[str, Any]]
+    column_catalog: list[dict[str, Any]]
+    value_catalog: list[dict[str, Any]]
     stored_rules: list[dict[str, Any]]
     selection_request: dict[str, Any]
     ir_structured_json: dict[str, Any]
@@ -55,6 +61,10 @@ class ModificationWorkflowState(TypedDict, total=False):
     preview_rows: list[dict[str, Any]]
     modification_text: str
     modification_logic: dict[str, Any]
+    workflow_steps: list[dict[str, Any]]
+    query_recommendations: list[dict[str, Any]]
+    resolution_candidates: list[dict[str, Any]]
+    resolution_warnings: list[str]
     mongo_query: dict[str, Any]
     matched_rules: list[dict[str, Any]]
     effective_modification_plan: dict[str, Any]

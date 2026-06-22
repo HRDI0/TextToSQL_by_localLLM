@@ -5,6 +5,7 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
 
 from app.langgraph_workflow.db import load_schema_metadata_node
+from app.langgraph_workflow.resolution import build_resolution_recommendations_node
 from app.langgraph_workflow.stage_01_parse import parse_ir_request_node
 from app.langgraph_workflow.stage_02_rule_lookup import lookup_mongodb_rule_node
 from app.langgraph_workflow.stage_03_sql import (
@@ -28,6 +29,7 @@ def build_modification_workflow_graph(llm: Any = None, connection: Any = None, d
 
     builder.add_node("load_schema_metadata", lambda state: load_schema_metadata_node(state, connection, db_config))
     builder.add_node("parse_ir_request", lambda state: parse_ir_request_node(state, llm))
+    builder.add_node("build_resolution_recommendations", build_resolution_recommendations_node)
     builder.add_node("generate_selection_sql", generate_selection_sql_node)
     builder.add_node("validate_selection_sql", validate_selection_sql_node)
     builder.add_node("fetch_target_dataset", lambda state: fetch_target_dataset_node(state, connection))
@@ -41,7 +43,8 @@ def build_modification_workflow_graph(llm: Any = None, connection: Any = None, d
 
     builder.add_edge(START, "load_schema_metadata")
     builder.add_edge("load_schema_metadata", "parse_ir_request")
-    builder.add_edge("parse_ir_request", "generate_selection_sql")
+    builder.add_edge("parse_ir_request", "build_resolution_recommendations")
+    builder.add_edge("build_resolution_recommendations", "generate_selection_sql")
     builder.add_edge("generate_selection_sql", "validate_selection_sql")
     builder.add_edge("validate_selection_sql", "fetch_target_dataset")
     builder.add_edge("fetch_target_dataset", "lookup_mongodb_rule")

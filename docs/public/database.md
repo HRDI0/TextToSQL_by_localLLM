@@ -11,7 +11,7 @@ This project expects tabular source data to be loaded into relational staging ta
 
 ## Validation Principles
 
-Generated SQL should be checked against live database metadata before preview or execution.
+Generated SQL should be checked against live database metadata before sample-impact review or execution.
 
 Validation should include:
 
@@ -20,7 +20,19 @@ Validation should include:
 - parameter count checks
 - blocked SQL token checks
 - fingerprinting of approved statements
-- preview generation before write execution
+- sample-impact generation before write execution
+
+Optional recommendation catalogs may be maintained outside the raw staging tables. These catalogs should contain only the metadata needed to suggest likely columns or values at request time. Public documentation should describe them generically and should not include real source values.
+
+```mermaid
+flowchart LR
+    Staging["Staging tables"]
+    Catalog["Column/value recommendation catalogs"]
+    Resolver["Recommendation resolver"]
+    Preview["New review run\nexecution disabled"]
+
+    Staging --> Catalog --> Resolver --> Preview
+```
 
 ## What Not To Publish
 

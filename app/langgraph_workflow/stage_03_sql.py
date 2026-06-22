@@ -27,6 +27,7 @@ def fingerprint_sql(sql: str, params: list[Any]) -> str:
 
 
 AGGREGATE_INTENT = "SELECT_AGGREGATE"
+SELECT_DETAIL_INTENT = "SELECT_DETAIL"
 UPDATE_INTENT = "UPDATE_NUMERIC_VALUE"
 ADD_DERIVED_COLUMN_INTENT = "ADD_DERIVED_COLUMN"
 ASK_CLARIFICATION_INTENT = "ASK_CLARIFICATION"
@@ -175,20 +176,18 @@ def requested_action_columns_from_text(
     return unique_preserve_order(requested)
 
 
-def build_selection_sql(selection_request: dict[str, Any]) -> dict[str, Any]:
+def build_selection_sql(
+    selection_request: dict[str, Any],
+    table_columns: dict[str, list[str]],
+    source_channel_values: dict[str, list[str]],
+) -> dict[str, Any]:
     table_name = selection_request.get("tables", ["SA"])[0]
     if table_name not in ALLOWED_TABLES:
         raise ValueError("Only DA and SA are allowed.")
 
-    where_parts: list[str] = []
-    params: list[Any] = []
-    source_channels = selection_request.get("source_channels", [])
-    if source_channels:
-        placeholders = ", ".join(["%s"] * len(source_channels))
-        where_parts.append(f"`source_channel` IN ({placeholders})")
-        params.extend(source_channels)
-
-    where_sql = " AND ".join(where_parts) if where_parts else "1 = 1"
+    compiled_scope = compile_selection_scope_to_where(selection_request, table_columns, source_channel_values)
+    where_sql = compiled_scope.get("sql", "1 = 1")
+    params = list(compiled_scope.get("params", []))
     sql = f"SELECT * FROM {quote_identifier(table_name)} WHERE {where_sql}"
     return {
         "sql_type": "SELECT",
@@ -200,7 +199,13 @@ def build_selection_sql(selection_request: dict[str, Any]) -> dict[str, Any]:
 
 
 def generate_selection_sql_node(state: ModificationWorkflowState) -> dict[str, Any]:
-    return {"selection_sql_plan": build_selection_sql(state["selection_request"])}
+    return {
+        "selection_sql_plan": build_selection_sql(
+            state["selection_request"],
+            state.get("table_columns", {}),
+            state.get("source_channel_values", {}),
+        )
+    }
 
 
 def validate_selection_sql_node(state: ModificationWorkflowState) -> dict[str, Any]:
@@ -210,7 +215,12 @@ def validate_selection_sql_node(state: ModificationWorkflowState) -> dict[str, A
     table_columns = state.get("table_columns", {})
     errors: list[str] = []
     checks: list[str] = []
-    unresolved_terms = selection_request.get("unresolved_terms", [])
+    unresolved_terms = unresolved_selection_terms(
+        selection_request.get("unresolved_terms", []),
+        str(table_name or ""),
+        table_columns,
+        state.get("column_alias_mappings", []),
+    )
 
     if plan.get("sql_type") == "SELECT":
         checks.append("select_only")
@@ -224,7 +234,7 @@ def validate_selection_sql_node(state: ModificationWorkflowState) -> dict[str, A
         checks.append("table_allowed_by_live_schema")
     else:
         errors.append("unknown_selection_table_in_live_schema")
-    if source_channel_filter_is_valid(plan, table_columns, state.get("source_channel_values", {})):
+    if source_channel_filter_is_valid(selection_request, table_columns, state.get("source_channel_values", {})):
         checks.append("source_channel_filter_valid")
     else:
         errors.append("source_channel_filter_not_in_live_schema_or_candidates")
@@ -241,18 +251,42 @@ def validate_selection_sql_node(state: ModificationWorkflowState) -> dict[str, A
     return {"selection_validation_result": {"status": "passed" if not errors else "failed", "checks": checks, "errors": errors}}
 
 
+def unresolved_selection_terms(
+    unresolved_terms: list[Any],
+    table_name: str,
+    table_columns: dict[str, list[str]],
+    column_alias_mappings: list[dict[str, Any]] | None = None,
+) -> list[Any]:
+    remaining: list[Any] = []
+    for term in unresolved_terms:
+        text = str(term or "").strip()
+        compact = compact_text(text)
+        if not text:
+            continue
+        if table_name == "SA" and "검색광고" in compact:
+            continue
+        if table_name == "DA" and "디스플레이" in compact:
+            continue
+        resolved = resolve_workflow_column(text, table_name, table_columns, column_alias_mappings)
+        if resolved in table_columns.get(table_name, []):
+            continue
+        remaining.append(term)
+    return remaining
+
+
 def source_channel_filter_is_valid(
-    plan: dict[str, Any],
+    selection_request: dict[str, Any],
     table_columns: dict[str, list[str]],
     source_channel_values: dict[str, list[str]],
 ) -> bool:
-    if not plan.get("params"):
+    source_channels = list(selection_request.get("source_channels", []))
+    if not source_channels:
         return True
-    table_name = plan.get("target_table")
+    table_name = (selection_request.get("tables") or [None])[0]
     if not isinstance(table_name, str):
         return False
     live_values = set(source_channel_values.get(table_name, []))
-    return "source_channel" in table_columns.get(table_name, []) and all(value in live_values for value in plan.get("params", []))
+    return "source_channel" in table_columns.get(table_name, []) and all(value in live_values for value in source_channels)
 
 
 def fetch_target_dataset_node(state: ModificationWorkflowState, connection: Any = None) -> dict[str, Any]:
@@ -300,7 +334,7 @@ def compile_condition_to_where(
 
     raw_field = condition["field"]
     values = list(condition.get("values", []))
-    alias_candidates = alias_candidate_columns(raw_field, table_name, table_columns, column_alias_mappings)
+    alias_candidates = [] if raw_field in table_columns.get(table_name, []) else alias_candidate_columns(raw_field, table_name, table_columns, column_alias_mappings)
     if len(alias_candidates) > 1:
         values = list(condition.get("values", []))
         if not values:
@@ -316,7 +350,8 @@ def compile_condition_to_where(
     sql = ""
     params: list[Any] = []
     if operator == "eq" and len(values) == 1:
-        sql = f"{quote_identifier(column)} = %s"
+        left_sql = column_sql_for_comparison(column, values)
+        sql = f"{left_sql} = %s"
         params = values
     elif operator in {"eq", "in"}:
         if not values:
@@ -479,6 +514,22 @@ def compile_selection_scope_to_where(
         period_column = resolve_column_from_import_rules(str(raw_period_column), table_name, table_columns)
         if period_column not in table_columns.get(table_name, []):
             raise ValueError(f"unknown_period_column_in_live_schema: {raw_period_column}")
+        year = period.get("year")
+        month = period.get("month")
+        if year and month:
+            numeric_month = int(month)
+            month_patterns = [
+                f"{int(year):04d}-{numeric_month:02d}-%",
+                f"{int(year):04d}.{numeric_month:02d}.%",
+                f"{int(year):04d}. {numeric_month}.%",
+                f"{int(year):04d}.{numeric_month}.%",
+            ]
+            placeholders = " OR ".join(f"{quote_identifier(period_column)} LIKE %s" for _ in month_patterns)
+            where_parts.append(f"({placeholders})")
+            params.extend(month_patterns)
+            columns.extend([period_column] * len(month_patterns))
+            predicate.extend({"column": period_column, "operator": "contains", "values": [pattern], "source": "selection"} for pattern in month_patterns)
+            return {"sql": " AND ".join(where_parts) if where_parts else "1 = 1", "params": params, "columns": columns, "predicate": predicate}
         start = period.get("start")
         end = period.get("end")
         if start and end:
@@ -492,6 +543,22 @@ def compile_selection_scope_to_where(
             raise ValueError("selection_period_requires_start_and_end")
 
     return {"sql": " AND ".join(where_parts) if where_parts else "1 = 1", "params": params, "columns": columns, "predicate": predicate}
+
+
+def read_only_conditions_to_where(state: ModificationWorkflowState, table_columns: dict[str, list[str]]) -> dict[str, Any]:
+    selection_request = state["selection_request"]
+    modification_logic = normalize_condition_values_from_rows(state.get("modification_logic", {}), state.get("target_rows", []))
+    modification_logic = recover_condition_values_from_text(modification_logic, state.get("modification_text", ""))
+    modification_logic = recover_or_conditions_from_text(modification_logic, state.get("modification_text", ""))
+    try:
+        return compile_conditions_to_where(
+            modification_logic,
+            selection_request,
+            table_columns,
+            state.get("column_alias_mappings", []),
+        )
+    except ValueError:
+        return {"sql": "1 = 1", "params": [], "columns": [], "predicate": []}
 
 
 def combine_where_predicates(*parts: dict[str, Any]) -> dict[str, Any]:
@@ -768,6 +835,13 @@ def group_by_columns_from_dictionary(
         target_column = str(item.get("target_column") or "")
         if user_term and user_term.lower() in lowered and target_column in columns:
             group_by.append(target_column)
+    compact = compact_text(text)
+    if ("날짜별" in compact or "날짜기준" in compact) and "날짜" in columns:
+        group_by.append("날짜")
+    if ("캠페인별" in compact or "캠페인기준" in compact) and "캠페인" in columns:
+        group_by.append("캠페인")
+    if ("기기별" in compact or "기기기준" in compact or "디바이스별" in compact or "디바이스기준" in compact) and "디바이스" in columns:
+        group_by.append("디바이스")
     return unique_preserve_order(group_by)
 
 
@@ -806,6 +880,44 @@ def metric_specs_from_dictionary(text: str, target_table: str, columns: list[str
         if spec:
             specs.append(spec)
     return specs
+
+
+def metric_specs_from_obvious_words(text: str, columns: list[str]) -> list[dict[str, Any]]:
+    compact = compact_text(text)
+    candidates = [
+        ("비용", "sum", ["비용합계", "광고비합계", "costsum", "spendsum"]),
+        ("비용", "avg", ["비용평균", "광고비평균", "costavg", "spendavg"]),
+        ("클릭수", "sum", ["클릭합계", "클릭수합계", "clicksum"]),
+        ("클릭수", "avg", ["클릭평균", "클릭수평균", "clickavg"]),
+        ("노출수", "sum", ["노출합계", "노출수합계", "impressionsum"]),
+        ("노출수", "avg", ["노출평균", "노출수평균", "impressionavg"]),
+        ("세션수", "sum", ["세션합계", "세션수합계", "sessionsum"]),
+        ("세션수", "avg", ["세션평균", "세션수평균", "sessionavg"]),
+    ]
+    specs: list[dict[str, Any]] = []
+    for column, expression_type, tokens in candidates:
+        if column not in columns:
+            continue
+        if any(compact_text(token) in compact for token in tokens):
+            suffix = "평균" if expression_type == "avg" else "합계"
+            specs.append({"alias": f"{column} {suffix}", "expression_type": expression_type, "source_column": column})
+    return specs
+
+
+def merge_metric_specs(primary: list[dict[str, Any]], fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for metric in [*primary, *fallback]:
+        source_column = str(metric.get("source_column") or metric.get("column") or "")
+        if "." in source_column:
+            source_column = source_column.split(".", 1)[1].strip("`")
+        expression_type = str(metric.get("expression_type") or "sum").lower()
+        key = (source_column, expression_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(metric)
+    return merged
 
 
 def metric_matches_definition(metric: dict[str, Any], item: dict[str, Any], text: str) -> bool:
@@ -937,8 +1049,16 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         raise ValueError("aggregate_sql_requires_live_target_table")
 
     selection_where = compile_selection_scope_to_where(selection_request, table_columns, state.get("source_channel_values", {}))
-    text = f"{state.get('selection_text', '')} {state.get('modification_text', '')}"
+    modification_where = read_only_conditions_to_where(state, table_columns)
+    precompiled_where = combine_where_predicates(selection_where, modification_where)
     modification_logic = state.get("modification_logic", {})
+    text = " ".join(
+        [
+            str(state.get("selection_text", "")),
+            str(state.get("modification_text", "")),
+            json.dumps(modification_logic, ensure_ascii=False),
+        ]
+    )
     column_alias_mappings = state.get("column_alias_mappings", [])
     group_by_columns = [
         resolve_workflow_column(str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or ""), target_table, table_columns, column_alias_mappings)
@@ -949,14 +1069,18 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
 
     metric_definitions = state.get("metric_definitions", [])
     dictionary_metrics = metric_specs_from_dictionary(text, target_table, columns, metric_definitions)
-    metrics = dictionary_metrics or [item for item in modification_logic.get("metrics", []) if isinstance(item, dict)]
+    parsed_metrics = [item for item in modification_logic.get("metrics", []) if isinstance(item, dict)]
+    metrics = dictionary_metrics or parsed_metrics
+    if not metrics:
+        metrics = metric_specs_from_obvious_words(text, columns)
     if metrics and not dictionary_metrics:
         metrics = [hydrate_metric_from_dictionary(metric, text, target_table, columns, metric_definitions) for metric in metrics]
+    metrics = merge_metric_specs(metrics, metric_specs_from_obvious_words(text, columns))
     if not metrics:
         raise ValueError("select_aggregate_requires_metrics")
 
     select_parts: list[str] = [f"{quote_identifier(column)} AS {quote_identifier(column)}" for column in group_by_columns]
-    referenced_columns: list[str] = [*group_by_columns, *selection_where.get("columns", [])]
+    referenced_columns: list[str] = [*group_by_columns, *precompiled_where.get("columns", [])]
     metric_params: list[Any] = []
     for metric in metrics:
         if str(metric.get("expression_type", "")).lower() == "cost_per_conversion" and any(token in text for token in ["빈값", "null", "NULL"]):
@@ -966,12 +1090,12 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         referenced_columns.extend(metric_columns)
         metric_params.extend(expression_params)
 
-    where_sql = selection_where.get("sql", "1 = 1")
+    where_sql = precompiled_where.get("sql", "1 = 1")
     group_sql = ""
     if group_by_columns:
         group_sql = " GROUP BY " + ", ".join(quote_identifier(column) for column in group_by_columns)
     sql = f"SELECT {', '.join(select_parts)} FROM {quote_identifier(target_table)} WHERE {where_sql}{group_sql}"
-    params = [*metric_params, *selection_where.get("params", [])]
+    params = [*metric_params, *precompiled_where.get("params", [])]
     return {
         "source": "deterministic_select_aggregate_renderer",
         "sql_type": "SELECT",
@@ -981,7 +1105,33 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         "target_table": target_table,
         "reason": "intent_type=SELECT_AGGREGATE; deterministic code rendered aggregate SELECT from IR and live schema.",
         "actions": [],
-        "predicate": selection_where.get("predicate", []),
+        "predicate": precompiled_where.get("predicate", []),
+        "sql_fingerprint": fingerprint_sql(sql, params),
+    }
+
+
+def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_columns: dict[str, list[str]]) -> dict[str, Any]:
+    selection_request = state["selection_request"]
+    target_table = selection_request.get("tables", ["SA"])[0]
+    columns = table_columns.get(target_table, [])
+    if target_table not in ALLOWED_TABLES or not columns:
+        raise ValueError("select_detail_requires_live_target_table")
+    selection_where = compile_selection_scope_to_where(selection_request, table_columns, state.get("source_channel_values", {}))
+    modification_where = read_only_conditions_to_where(state, table_columns)
+    precompiled_where = combine_where_predicates(selection_where, modification_where)
+    where_sql = precompiled_where.get("sql", "1 = 1")
+    params = list(precompiled_where.get("params", []))
+    sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}"
+    return {
+        "source": "deterministic_select_detail_renderer",
+        "sql_type": "SELECT",
+        "sql": sql,
+        "params": params,
+        "referenced_columns": unique_preserve_order(precompiled_where.get("columns", [])),
+        "target_table": target_table,
+        "reason": "intent_type=SELECT_DETAIL; rendered row-level SELECT inside the first requested scope.",
+        "actions": [],
+        "predicate": precompiled_where.get("predicate", []),
         "sql_fingerprint": fingerprint_sql(sql, params),
     }
 
@@ -1002,6 +1152,27 @@ def infer_derived_column_spec(modification_logic: dict[str, Any], modification_t
     quoted_tokens = re.findall(r"`([^`]+)`", modification_text)
     if not derived_value and quoted_tokens:
         derived_value = quoted_tokens[-1].strip()
+    assignment_match = re.search(
+        r"(?:^|[\s에])(?P<key>[가-힣A-Za-z0-9 _-]{2,40}?(?:분류값|구분값|상태값|상태 값|값))\s*(?:을|를)\s*"
+        r"(?P<value>[가-힣A-Za-z0-9 _-]{2,40}?)\s*(?:으로|로)\s*(?:붙|분류|기입|만들)",
+        modification_text,
+    )
+    if assignment_match:
+        if not derived_key:
+            derived_key = re.sub(r"\s+", " ", assignment_match.group("key")).strip()
+        if not derived_value:
+            derived_value = re.sub(r"\s+", " ", assignment_match.group("value")).strip()
+    label_match = re.search(
+        r"(?P<value>[가-힣A-Za-z0-9 _-]{2,40}?)\s*(?P<key>분류값|구분값|상태값|상태 값|확인 값|값)\s*(?:을|를)\s*(?:붙|기입|만들)",
+        modification_text,
+    )
+    if label_match:
+        key = re.sub(r"\s+", " ", label_match.group("key")).strip()
+        value = re.sub(r"\s+", " ", label_match.group("value")).strip()
+        if not derived_key:
+            derived_key = key if key != "값" else "derived_label"
+        if not derived_value:
+            derived_value = value
     if not derived_key:
         if len(quoted_tokens) >= 2:
             derived_key = quoted_tokens[0].strip()
@@ -1122,6 +1293,42 @@ def generate_crud_sql_candidate(
     }
 
 
+def compile_structured_actions_sql_candidate(
+    modification_logic: dict[str, Any],
+    target_table: str,
+    precompiled_where: dict[str, Any],
+    table_columns: dict[str, list[str]],
+    column_alias_mappings: list[dict[str, Any]] | None = None,
+    requested_target_fields: list[str] | None = None,
+    protected_column_policies: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    actions = iter_actions(modification_logic)
+    set_sql, set_params, target_fields, normalized_actions = actions_to_set_clause(
+        actions,
+        target_table,
+        table_columns,
+        column_alias_mappings,
+        requested_target_fields,
+        protected_column_policies,
+    )
+    if precompiled_where["sql"] == "1 = 1":
+        raise ValueError("write_sql_requires_compiled_selection_or_modification_predicate")
+    sql = f"UPDATE {quote_identifier(target_table)} SET {set_sql} WHERE {precompiled_where['sql']}"
+    params = set_params + list(precompiled_where.get("params", []))
+    return {
+        "source": "structured_ir_action_sql_builder",
+        "sql_type": "UPDATE",
+        "sql": sql,
+        "params": params,
+        "referenced_columns": [*target_fields, *precompiled_where.get("columns", [])],
+        "target_table": target_table,
+        "reason": "IR already contained structured actions; deterministic code compiled the allowlisted SQL shape.",
+        "actions": normalized_actions,
+        "predicate": precompiled_where.get("predicate", []),
+        "sql_fingerprint": fingerprint_sql(sql, params),
+    }
+
+
 def generate_or_reuse_sql_node(state: ModificationWorkflowState, llm: Any = None) -> dict[str, Any]:
     table_columns = state.get("table_columns", {})
     target_table = state.get("selection_request", {}).get("tables", ["SA"])[0]
@@ -1129,6 +1336,9 @@ def generate_or_reuse_sql_node(state: ModificationWorkflowState, llm: Any = None
     try:
         if intent_type == ASK_CLARIFICATION_INTENT:
             raise ValueError("intent_requires_clarification_before_sql_generation")
+        if intent_type == SELECT_DETAIL_INTENT:
+            sql_candidate = build_select_detail_sql_candidate(state, table_columns)
+            return {"precompiled_where": {"sql": "1 = 1", "params": [], "columns": [], "predicate": []}, "sql_candidate": sql_candidate}
         if intent_type == ADD_DERIVED_COLUMN_INTENT:
             sql_candidate = build_derived_value_insert_sql_candidate(state, table_columns)
             return {
@@ -1171,7 +1381,17 @@ def generate_or_reuse_sql_node(state: ModificationWorkflowState, llm: Any = None
                 precompiled_where,
                 table_columns,
                 column_alias_mappings,
-                requested_target_fields,
+                None,
+                protected_column_policies,
+            )
+        elif any(group.get("actions") for group in modification_logic.get("condition_groups", []) if isinstance(group, dict)):
+            sql_candidate = compile_structured_actions_sql_candidate(
+                modification_logic,
+                target_table,
+                precompiled_where,
+                table_columns,
+                column_alias_mappings,
+                None,
                 protected_column_policies,
             )
         else:
@@ -1245,9 +1465,9 @@ def parse_where_clause(where_sql: str) -> list[dict[str, Any]]:
                 nested_conditions.extend(parse_where_clause(nested_clause))
             conditions.extend(nested_conditions)
             continue
-        equals_match = re.fullmatch(r"`([^`]+)`\s*=\s*%s", clause, flags=re.IGNORECASE)
+        equals_match = re.fullmatch(r"(?:`([^`]+)`|CAST\(NULLIF\(`([^`]+)`,\s*''\)\s+AS\s+DECIMAL\(18,2\)\))\s*=\s*%s", clause, flags=re.IGNORECASE)
         if equals_match:
-            conditions.append({"column": equals_match.group(1), "operator": "eq", "placeholder_count": 1})
+            conditions.append({"column": equals_match.group(1) or equals_match.group(2), "operator": "eq", "placeholder_count": 1})
             continue
         comparison_match = re.fullmatch(r"(?:`([^`]+)`|CAST\(NULLIF\(`([^`]+)`,\s*''\)\s+AS\s+DECIMAL\(18,2\)\))\s*(>=|<=|>|<)\s*%s", clause, flags=re.IGNORECASE)
         if comparison_match:

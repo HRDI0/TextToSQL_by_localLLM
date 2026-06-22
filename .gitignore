@@ -46,13 +46,12 @@ AGENTS.md
 **/AGENTS.md
 
 # Internal/confidential documentation
+docs/docs__/
 docs/**
 !docs/
 !docs/public/
 !docs/public/**
-test/*.md
-test/**/*result*.md
-
+test/
 # Internal database schema and migration files
 migrations/
 

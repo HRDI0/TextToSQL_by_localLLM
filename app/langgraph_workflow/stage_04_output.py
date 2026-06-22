@@ -234,6 +234,8 @@ def build_change_preview_json(
         "operation": sql_candidate.get("sql_type"),
         "target_table": sql_candidate.get("target_table"),
         "rendered_sql": rendered_sql or sql_candidate.get("sql", ""),
+        "preview_generation_source": "deterministic_python_script",
+        "preview_generation_note": "Sample rows and before/after examples are derived by Python code from validated SQL metadata and database rows, not by the LLM.",
         "sql_fingerprint": sql_candidate.get("sql_fingerprint"),
         "preview_fingerprint": preview_fingerprint(preview_rows, affected_row_count, sql_candidate.get("sql_fingerprint")),
         "affected_row_count": affected_row_count,
@@ -440,6 +442,8 @@ def build_row_modification_examples(state: ModificationWorkflowState) -> dict[st
     sample_rows = filter_sample_rows([preview_row_to_sample_row(row) for row in examples])
     return {
         "status": change_preview_json.get("status"),
+        "preview_generation_source": change_preview_json.get("preview_generation_source"),
+        "preview_generation_note": change_preview_json.get("preview_generation_note"),
         "affected_row_count": change_preview_json.get("affected_row_count", 0),
         "previewed_row_count": change_preview_json.get("previewed_row_count", 0),
         "preview_limited": change_preview_json.get("preview_limited", False),
@@ -506,6 +510,10 @@ def build_final_output_json(state: ModificationWorkflowState) -> dict[str, Any]:
         "ir_structured_json": ir_structured_json,
         "query_from_ir": build_query_from_ir(state),
         "row_modification_examples": build_row_modification_examples(state),
+        "workflow_steps": state.get("workflow_steps", []),
+        "query_recommendations": state.get("query_recommendations", []),
+        "resolution_candidates": state.get("resolution_candidates", []),
+        "resolution_warnings": state.get("resolution_warnings", []),
         "execution_result": build_execution_result_json(
             execution_result=state.get("execution_result", {}),
             effective_modification_plan=state.get("effective_modification_plan", {}),

@@ -23,11 +23,11 @@ from app.langgraph_workflow.state import (
 
 def db_config_from_env() -> DbConfig:
     return DbConfig(
-        host=os.environ.get("SQL_WORKFLOW_DB_HOST", DEFAULT_DB_HOST),
-        port=int(os.environ.get("SQL_WORKFLOW_DB_PORT", str(DEFAULT_DB_PORT))),
-        user=os.environ.get("SQL_WORKFLOW_DB_USER", DEFAULT_DB_USER),
-        password=os.environ.get("SQL_WORKFLOW_DB_PASSWORD", DEFAULT_DB_PASSWORD),
-        database=os.environ.get("SQL_WORKFLOW_DB_NAME", DEFAULT_DB_NAME),
+        host=os.environ.get("SQL_WORKFLOW_DB_HOST") or os.environ.get("KTM_DB_HOST") or DEFAULT_DB_HOST,
+        port=int(os.environ.get("SQL_WORKFLOW_DB_PORT") or os.environ.get("KTM_DB_PORT") or str(DEFAULT_DB_PORT)),
+        user=os.environ.get("SQL_WORKFLOW_DB_USER") or os.environ.get("KTM_DB_USER") or DEFAULT_DB_USER,
+        password=os.environ.get("SQL_WORKFLOW_DB_PASSWORD") or os.environ.get("KTM_DB_PASSWORD") or DEFAULT_DB_PASSWORD,
+        database=os.environ.get("SQL_WORKFLOW_DB_NAME") or os.environ.get("KTM_DB_NAME") or DEFAULT_DB_NAME,
     )
 
 
@@ -117,6 +117,8 @@ def fetch_business_dictionary_metadata(connection: Any, database: str) -> dict[s
         "column_alias_mappings": [],
         "metric_definitions": [],
         "protected_column_policies": [],
+        "column_catalog": [],
+        "value_catalog": [],
     }
     if table_exists(connection, database, "rule_engine_source_channel_map"):
         with connection.cursor() as cursor:
@@ -168,6 +170,27 @@ def fetch_business_dictionary_metadata(connection: Any, database: str) -> dict[s
                 """
             )
             metadata["protected_column_policies"] = list(cursor.fetchall())
+    if table_exists(connection, database, "rule_engine_column_catalog"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT target_table, column_name, normalized_column_name, semantic_role, distinct_count
+                FROM rule_engine_column_catalog
+                ORDER BY target_table, column_name
+                """
+            )
+            metadata["column_catalog"] = list(cursor.fetchall())
+    if table_exists(connection, database, "rule_engine_value_catalog"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT target_table, column_name, normalized_value, raw_value, frequency
+                FROM rule_engine_value_catalog
+                ORDER BY frequency DESC, target_table, column_name
+                LIMIT 500
+                """
+            )
+            metadata["value_catalog"] = list(cursor.fetchall())
     return metadata
 
 
@@ -228,6 +251,8 @@ def load_schema_metadata_node(
             "column_alias_mappings": state.get("column_alias_mappings", []),
             "metric_definitions": state.get("metric_definitions", []),
             "protected_column_policies": state.get("protected_column_policies", []),
+            "column_catalog": state.get("column_catalog", []),
+            "value_catalog": state.get("value_catalog", []),
         }
         return {
             "table_columns": table_columns,
@@ -245,6 +270,8 @@ def load_schema_metadata_node(
             "column_alias_mappings": [],
             "metric_definitions": [],
             "protected_column_policies": [],
+            "column_catalog": [],
+            "value_catalog": [],
             "schema_summary": build_schema_summary({}),
             "errors": append_error(state, f"schema_metadata_query_failed: {exc}"),
         }
@@ -257,6 +284,8 @@ def load_schema_metadata_node(
             "column_alias_mappings": dictionary_metadata.get("column_alias_mappings", []),
             "metric_definitions": dictionary_metadata.get("metric_definitions", []),
             "protected_column_policies": dictionary_metadata.get("protected_column_policies", []),
+            "column_catalog": dictionary_metadata.get("column_catalog", []),
+            "value_catalog": dictionary_metadata.get("value_catalog", []),
             "schema_summary": build_schema_summary({}),
             "errors": append_error(state, "schema_metadata_query_returned_no_DA_SA_columns"),
         }
@@ -267,5 +296,7 @@ def load_schema_metadata_node(
         "column_alias_mappings": dictionary_metadata.get("column_alias_mappings", []),
         "metric_definitions": dictionary_metadata.get("metric_definitions", []),
         "protected_column_policies": dictionary_metadata.get("protected_column_policies", []),
+        "column_catalog": dictionary_metadata.get("column_catalog", []),
+        "value_catalog": dictionary_metadata.get("value_catalog", []),
         "schema_summary": build_schema_summary(table_columns, source_channel_values, dictionary_metadata),
     }
