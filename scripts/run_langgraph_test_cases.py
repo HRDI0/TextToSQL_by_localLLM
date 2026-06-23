@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 
-from app.streamlit_langgraph_test import filtered_ir_for_step, run_graph  # noqa: E402
+from app.streamlit_langgraph_test import effective_preview_context_for_step, filtered_ir_for_step, preview_delta_items_from_result, run_graph  # noqa: E402
 
 
 TEST_FILE = PROJECT_ROOT / "test" / "test.md"
@@ -606,11 +606,24 @@ def summarize_multistep_result(case_number: str, result: dict[str, Any], selecti
     if len(steps) <= 1:
         return None
     step_summaries: list[dict[str, Any]] = []
+    accepted_step_ids: set[str] = set()
+    step_preview_results: dict[str, dict[str, Any]] = {}
     for index, step in enumerate(steps, start=1):
         step_id = str(step.get("step_id") or step.get("group_id"))
         try:
-            step_result = run_graph(selection_text, modification_text, [], approved=False, ir_override=filtered_ir_for_step(result, step_id))
+            step_result = run_graph(
+                selection_text,
+                modification_text,
+                [],
+                approved=False,
+                ir_override=filtered_ir_for_step(result, step_id),
+                active_step_id=step_id,
+                effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted_step_ids, step_preview_results),
+            )
             step_summary = summarize_result(f"{case_number}.{index}", step_result, modification_text)
+            if step_summary.get("status") == "PASS":
+                step_preview_results[step_id] = {**step_result, "preview_delta_items": preview_delta_items_from_result(step_result, "approved")}
+                accepted_step_ids.add(step_id)
         except Exception as exc:
             step_summary = {
                 "status": "ERROR",

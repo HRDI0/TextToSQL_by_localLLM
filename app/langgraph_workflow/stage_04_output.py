@@ -62,7 +62,7 @@ def build_preview_from_candidate(
     connection: Any,
     sql_candidate: dict[str, Any],
     limit: int = 2,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
     if sql_candidate.get("sql_type") == "SELECT":
         if connection is None:
             raise ValueError("SELECT preview rows must be derived from the database with the validated SQL.")
@@ -70,7 +70,7 @@ def build_preview_from_candidate(
         with connection.cursor() as cursor:
             cursor.execute(preview_sql, tuple([*sql_candidate.get("params", []), limit]))
             rows = list(cursor.fetchall())
-        return [{"row_index": index, "db_row": row} for index, row in enumerate(rows)], len(rows)
+        return [{"row_index": index, "db_row": row} for index, row in enumerate(rows)], len(rows), []
     if sql_candidate.get("sql_type") == "INSERT" and sql_candidate.get("source") == "derived_value_insert_renderer":
         if connection is None:
             raise ValueError("Derived-value preview rows must be derived from the database with the validated SQL predicate.")
@@ -93,9 +93,9 @@ def build_preview_from_candidate(
             }
             for index, row in enumerate(target_rows)
         ]
-        return preview_rows, affected_row_count
+        return preview_rows, affected_row_count, []
     if sql_candidate.get("sql_type") != "UPDATE":
-        return [], 0
+        return [], 0, []
     if connection is None:
         raise ValueError("Preview rows must be derived from the database with the validated SQL predicate.")
 
@@ -106,20 +106,35 @@ def build_preview_from_candidate(
     where_sql = extract_update_where_sql(sql_candidate["sql"])
     where_params = list(sql_candidate.get("params", []))[len(actions) :]
     count_sql = f"SELECT COUNT(*) AS affected_row_count FROM {quote_identifier(target_table)} WHERE {where_sql}"
-    select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql} LIMIT %s"
+    select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}"
 
     with connection.cursor() as cursor:
         cursor.execute(count_sql, tuple(where_params))
         affected_row_count = int(cursor.fetchone()["affected_row_count"])
-        cursor.execute(select_sql, tuple([*where_params, limit]))
+        cursor.execute(select_sql, tuple(where_params))
         target_rows = list(cursor.fetchall())
 
     preview_rows: list[dict[str, Any]] = []
+    delta_items: list[dict[str, Any]] = []
     for index, row in enumerate(target_rows):
         before = {action["target_field"]: row.get(action["target_field"]) for action in actions}
         after = {action["target_field"]: apply_action_value(row, action) for action in actions}
-        preview_rows.append({"row_index": index, "db_row": row, "before": before, "after": after})
-    return preview_rows, affected_row_count
+        delta_item = {
+            "step_id": sql_candidate.get("active_step_id"),
+            "step_order": sql_candidate.get("active_step_order"),
+            "target_table": target_table,
+            "source_row_id": row.get("row_id"),
+            "source_row_hash": row.get("source_row_hash"),
+            "delta_type": "preview_update",
+            "before": before,
+            "after": after,
+            "delta": {column: {"old_value": before.get(column), "new_value": after.get(column)} for column in after},
+            "status": sql_candidate.get("delta_status", "pending"),
+        }
+        delta_items.append(delta_item)
+        if len(preview_rows) < limit:
+            preview_rows.append({"row_index": index, "db_row": row, "before": before, "after": after, "delta_item": delta_item})
+    return preview_rows, affected_row_count, delta_items
 
 
 def render_sql_preview(connection: Any, sql_candidate: dict[str, Any]) -> str:
@@ -222,6 +237,7 @@ def build_change_preview_json(
     affected_row_count: int,
     rendered_sql: str | None = None,
     preview_error: str | None = None,
+    preview_delta_items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if validation_result.get("status") != "passed":
         status = "blocked_by_validation"
@@ -242,6 +258,7 @@ def build_change_preview_json(
         "previewed_row_count": len(preview_rows),
         "preview_limited": affected_row_count > len(preview_rows),
         "changes": preview_rows,
+        "preview_delta_items": preview_delta_items or [],
         "validation_result": validation_result,
         "preview_error": preview_error,
     }
@@ -264,14 +281,34 @@ def build_change_preview_json_node(state: ModificationWorkflowState, connection:
     preview_error = None
     try:
         rendered_sql = render_sql_preview(connection, state["sql_candidate"])
-        preview_rows, affected_row_count = build_preview_from_candidate(connection, state["sql_candidate"])
+        sql_candidate = {
+            **state["sql_candidate"],
+            "active_step_id": state.get("active_step_id"),
+            "active_step_order": state.get("effective_preview_context", {}).get("active_step_order"),
+        }
+        preview_rows, affected_row_count, preview_delta_items = build_preview_from_candidate(connection, sql_candidate)
     except Exception as exc:
         rendered_sql = state["sql_candidate"].get("sql", "")
         preview_rows = []
+        preview_delta_items = []
         affected_row_count = 0
         preview_error = str(exc)
+    linked_step_result = {
+        "step_id": state.get("active_step_id"),
+        "sql_fingerprint": state["sql_candidate"].get("sql_fingerprint"),
+        "sql_type": state["sql_candidate"].get("sql_type"),
+        "target_table": state["sql_candidate"].get("target_table"),
+        "affected_row_count": affected_row_count,
+        "previewed_row_count": len(preview_rows),
+        "preview_delta_items": preview_delta_items,
+    }
+    linked_step_results = [*state.get("linked_step_results", [])]
+    if state.get("active_step_id"):
+        linked_step_results.append(linked_step_result)
     return {
         "preview_rows": preview_rows,
+        "preview_delta_items": preview_delta_items,
+        "linked_step_results": linked_step_results,
         "change_preview_json": build_change_preview_json(
             state["sql_candidate"],
             validation_result,
@@ -279,6 +316,7 @@ def build_change_preview_json_node(state: ModificationWorkflowState, connection:
             affected_row_count,
             rendered_sql,
             preview_error,
+            preview_delta_items,
         ),
     }
 
@@ -317,6 +355,14 @@ def wait_for_user_confirmation_node(state: ModificationWorkflowState) -> dict[st
 
 def execute_confirmed_sql(connection: Any, state: ModificationWorkflowState) -> dict[str, Any]:
     sql_candidate = state["sql_candidate"]
+    if state.get("active_step_id"):
+        return {
+            "status": "skipped",
+            "reason": "linked_step_preview_approval_only",
+            "operation": sql_candidate.get("sql_type"),
+            "target_table": sql_candidate.get("target_table"),
+            "affected_row_count": 0,
+        }
     if sql_candidate.get("execution_allowed") is False:
         return {
             "status": "skipped",
@@ -363,6 +409,15 @@ def execute_confirmed_sql(connection: Any, state: ModificationWorkflowState) -> 
 
 
 def execute_confirmed_sql_node(state: ModificationWorkflowState, connection: Any = None) -> dict[str, Any]:
+    if state.get("active_step_id"):
+        return {
+            "execution_result": {
+                "status": "skipped",
+                "reason": "linked_step_preview_approval_only",
+                "operation": state["sql_candidate"].get("sql_type"),
+                "target_table": state["sql_candidate"].get("target_table"),
+            }
+        }
     if state["sql_candidate"].get("execution_allowed") is False:
         return {
             "execution_result": {
@@ -511,6 +566,11 @@ def build_final_output_json(state: ModificationWorkflowState) -> dict[str, Any]:
         "query_from_ir": build_query_from_ir(state),
         "row_modification_examples": build_row_modification_examples(state),
         "workflow_steps": state.get("workflow_steps", []),
+        "linked_step_plan": state.get("linked_step_plan", []),
+        "linked_step_validation": state.get("linked_step_validation", {}),
+        "preview_delta_items": state.get("preview_delta_items", []),
+        "effective_preview_context": state.get("effective_preview_context", {}),
+        "linked_step_results": state.get("linked_step_results", []),
         "query_recommendations": state.get("query_recommendations", []),
         "resolution_candidates": state.get("resolution_candidates", []),
         "resolution_warnings": state.get("resolution_warnings", []),

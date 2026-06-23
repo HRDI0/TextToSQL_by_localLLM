@@ -54,6 +54,8 @@ docs/**
 test/
 # Internal database schema and migration files
 migrations/
+!migrations/
+!migrations/005_linked_step_plan.sql
 
 # Raw data, archives, and generated local assets
 data/raw*/

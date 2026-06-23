@@ -62,6 +62,14 @@ class ModificationWorkflowState(TypedDict, total=False):
     modification_text: str
     modification_logic: dict[str, Any]
     workflow_steps: list[dict[str, Any]]
+    linked_step_plan: list[dict[str, Any]]
+    linked_step_validation: dict[str, Any]
+    linked_plan_id: int
+    active_step_id: str
+    accepted_step_ids: list[str]
+    preview_delta_items: list[dict[str, Any]]
+    effective_preview_context: dict[str, Any]
+    linked_step_results: list[dict[str, Any]]
     query_recommendations: list[dict[str, Any]]
     resolution_candidates: list[dict[str, Any]]
     resolution_warnings: list[str]

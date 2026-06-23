@@ -143,6 +143,8 @@ def run_graph(
     approved_sql_fingerprint: str | None = None,
     approved_preview_fingerprint: str | None = None,
     ir_override: dict[str, Any] | None = None,
+    active_step_id: str | None = None,
+    effective_preview_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = build_demo_state(approved=approved, stored_rules=stored_rules)
     state.update(
@@ -155,6 +157,10 @@ def run_graph(
         state["approved_sql_fingerprint"] = approved_sql_fingerprint
     if approved_preview_fingerprint:
         state["approved_preview_fingerprint"] = approved_preview_fingerprint
+    if active_step_id:
+        state["active_step_id"] = active_step_id
+    if effective_preview_context:
+        state["effective_preview_context"] = effective_preview_context
     if ir_override:
         state["ir_structured_json"] = ir_override
         state["selection_request"] = dict(ir_override.get("selection", {}))
@@ -165,7 +171,7 @@ def run_graph(
         return graph.invoke(state)
 
 
-def apply_existing_preview_result(result: dict[str, Any], approved: bool) -> dict[str, Any]:
+def apply_existing_preview_result(result: dict[str, Any], approved: bool, execute: bool = True) -> dict[str, Any]:
     updated = dict(result)
     change_preview_json = updated.get("change_preview_json", {})
     user_confirmation = {
@@ -184,9 +190,16 @@ def apply_existing_preview_result(result: dict[str, Any], approved: bool) -> dic
             "operation": updated.get("sql_candidate", {}).get("sql_type"),
             "target_table": updated.get("sql_candidate", {}).get("target_table"),
         }
-    elif can_execute(updated["validation_result"], user_confirmation, change_preview_json):
+    elif execute and can_execute(updated["validation_result"], user_confirmation, change_preview_json):
         with connect_db() as connection:
             updated["execution_result"] = execute_confirmed_sql(connection, cast(ModificationWorkflowState, updated))
+    elif not execute:
+        updated["execution_result"] = {
+            "status": "skipped",
+            "reason": "linked_step_preview_approval_only",
+            "operation": updated.get("sql_candidate", {}).get("sql_type"),
+            "target_table": updated.get("sql_candidate", {}).get("target_table"),
+        }
     else:
         updated["execution_result"] = {
             "status": "skipped",
@@ -454,7 +467,8 @@ def normalize_step_source_channel_conditions(group: dict[str, Any], table: str, 
 
 
 def inherit_dependent_select_conditions(group: dict[str, Any], groups: list[dict[str, Any]]) -> dict[str, Any]:
-    if str(group.get("intent_type") or "").upper() not in {"SELECT_DETAIL", "UPDATE_NUMERIC_VALUE", "SELECT_AGGREGATE", "ADD_DERIVED_COLUMN"}:
+    intent_type = str(group.get("intent_type") or "").upper()
+    if intent_type not in {"SELECT_DETAIL", "UPDATE_NUMERIC_VALUE", "SELECT_AGGREGATE", "ADD_DERIVED_COLUMN"}:
         return group
     by_id = {str(candidate.get("group_id") or candidate.get("step_id")): candidate for candidate in groups}
     pending = [str(item) for item in group.get("depends_on", [])]
@@ -533,13 +547,57 @@ def ancestor_step_ids(steps: list[dict[str, Any]], step_id: str) -> set[str]:
 
 
 def preview_signature(step_id: str, steps: list[dict[str, Any]], accepted: set[str], cancelled: set[str]) -> str:
-    ancestors = ancestor_step_ids(steps, step_id)
+    current_order = step_order_for_id(steps, step_id)
+    prior_ids = {
+        str(step.get("step_id") or step.get("group_id"))
+        for step in steps
+        if step_order_for_id(steps, str(step.get("step_id") or step.get("group_id"))) < current_order
+    }
     payload = {
         "step_id": step_id,
-        "accepted_ancestors": sorted(ancestors & accepted),
-        "cancelled_ancestors": sorted(ancestors & cancelled),
+        "accepted_prior_steps": sorted(prior_ids & accepted),
+        "cancelled_prior_steps": sorted(prior_ids & cancelled),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def step_order_for_id(steps: list[dict[str, Any]], step_id: str) -> int:
+    for index, step in enumerate(steps, start=1):
+        if str(step.get("step_id") or step.get("group_id")) == step_id:
+            return index
+    return 0
+
+
+def preview_delta_items_from_result(result: dict[str, Any], status: str = "approved") -> list[dict[str, Any]]:
+    items = result.get("preview_delta_items") or result.get("change_preview_json", {}).get("preview_delta_items", [])
+    if not isinstance(items, list):
+        return []
+    return [{**item, "status": status} for item in items if isinstance(item, dict) and item.get("source_row_id") not in {None, ""}]
+
+
+def effective_preview_context_for_step(
+    steps: list[dict[str, Any]],
+    step_id: str,
+    accepted: set[str],
+    previews: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    current_order = step_order_for_id(steps, step_id)
+    delta_items: list[dict[str, Any]] = []
+    for step in steps:
+        prior_id = str(step.get("step_id") or step.get("group_id"))
+        if prior_id not in accepted or step_order_for_id(steps, prior_id) >= current_order:
+            continue
+        delta_items.extend(preview_delta_items_from_result(previews.get(prior_id, {}), "approved"))
+    return {"active_step_order": current_order, "delta_items": delta_items}
+
+
+def later_step_ids(steps: list[dict[str, Any]], step_id: str) -> set[str]:
+    current_order = step_order_for_id(steps, step_id)
+    return {
+        str(step.get("step_id") or step.get("group_id"))
+        for step in steps
+        if step_order_for_id(steps, str(step.get("step_id") or step.get("group_id"))) > current_order
+    }
 
 
 def preview_fingerprint_from_result(result: dict[str, Any]) -> str | None:
@@ -557,6 +615,19 @@ def preview_changed(old_fingerprint: str | None, new_result: dict[str, Any] | No
     if not new_fingerprint:
         return None
     return old_fingerprint != new_fingerprint
+
+
+def preview_can_be_approved(result: dict[str, Any] | None) -> bool:
+    if not result:
+        return False
+    validation_result = result.get("validation_result", {})
+    change_preview_json = result.get("change_preview_json", {})
+    return (
+        validation_result.get("status") == "passed"
+        and change_preview_json.get("status") == "pending_user_confirmation"
+        and bool(change_preview_json.get("sql_fingerprint"))
+        and bool(change_preview_json.get("preview_fingerprint"))
+    )
 
 
 def step_is_available(step: dict[str, Any], accepted_step_ids: set[str], cancelled_step_ids: set[str]) -> bool:
@@ -692,7 +763,7 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
             st.json({"depends_on": step.get("depends_on", []), "conditions": step.get("conditions", []), "actions": step.get("actions", [])})
             available = step_is_available(step, accepted, cancelled)
             current_signature = preview_signature(step_id, steps, accepted, cancelled)
-            preview_ready = step_id in previews and signatures.get(step_id) == current_signature
+            preview_ready = step_id in previews and signatures.get(step_id) == current_signature and preview_can_be_approved(previews.get(step_id))
             if not available and step_id not in cancelled:
                 st.warning("앞 요청이 아직 승인되지 않았거나 취소되어 이 결과는 다시 확인할 수 없습니다.")
             cols = st.columns(3)
@@ -703,21 +774,33 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                     stored_rules=last_input.get("stored_rules", []),
                     approved=False,
                     ir_override=filtered_ir_for_step(result, step_id),
+                    active_step_id=step_id,
+                    effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews),
                 )
                 signatures[step_id] = current_signature
                 st.session_state[preview_key] = previews
                 st.session_state[signature_key] = signatures
                 st.rerun()
             if cols[1].button("이 요청 승인", key=f"approve_{step_id}", disabled=not preview_ready or not available):
-                previews[step_id] = apply_existing_preview_result(previews[step_id], True)
+                previews[step_id] = apply_existing_preview_result(previews[step_id], True, execute=False)
                 accepted.add(step_id)
                 cancelled.discard(step_id)
+                for invalid_step in later_step_ids(steps, step_id):
+                    if invalid_step in previews:
+                        stale_previews[invalid_step] = {
+                            "preview_fingerprint": preview_fingerprint_from_result(previews[invalid_step]),
+                            "reason": "upstream_delta_changed",
+                        }
+                    previews.pop(invalid_step, None)
+                    signatures.pop(invalid_step, None)
                 st.session_state[accepted_key] = sorted(accepted)
                 st.session_state[cancelled_key] = sorted(cancelled)
                 st.session_state[preview_key] = previews
+                st.session_state[signature_key] = signatures
+                st.session_state[stale_key] = stale_previews
                 st.rerun()
             if cols[2].button("이 요청 취소", key=f"cancel_{step_id}", disabled=step_id in accepted):
-                invalidated = step_ids_to_invalidate(steps, step_id)
+                invalidated = {step_id, *later_step_ids(steps, step_id)}
                 cancelled.update(invalidated)
                 accepted.difference_update(invalidated)
                 for invalid_step in invalidated:
@@ -737,7 +820,13 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                 show_final_result(previews[step_id])
 
     available_step_ids = [str(step.get("step_id") or step.get("group_id")) for step in steps if step_is_available(step, accepted, cancelled)]
-    missing_preview_ids = [step_id for step_id in available_step_ids if step_id not in previews]
+    missing_preview_ids = [
+        step_id
+        for step_id in available_step_ids
+        if step_id not in previews
+        or signatures.get(step_id) != preview_signature(step_id, steps, accepted, cancelled)
+        or not preview_can_be_approved(previews.get(step_id))
+    ]
     preview_all_col, approve_all_col = st.columns(2)
     if preview_all_col.button("확인 가능한 요청 모두 보기", key="preview_all_steps", disabled=not missing_preview_ids):
         for step in steps:
@@ -750,25 +839,18 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                 stored_rules=last_input.get("stored_rules", []),
                 approved=False,
                 ir_override=filtered_ir_for_step(result, step_id),
+                active_step_id=step_id,
+                effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews),
             )
             signatures[step_id] = preview_signature(step_id, steps, accepted, cancelled)
         st.session_state[preview_key] = previews
         st.session_state[signature_key] = signatures
         st.rerun()
-    if approve_all_col.button("확인된 요청 모두 승인", key="approve_all_steps", disabled=bool(missing_preview_ids) or not available_step_ids):
-        for step_id in available_step_ids:
-            if step_id in accepted:
-                continue
-            previews[step_id] = apply_existing_preview_result(previews[step_id], True)
-            accepted.add(step_id)
-            cancelled.discard(step_id)
-        st.session_state[accepted_key] = sorted(accepted)
-        st.session_state[cancelled_key] = sorted(cancelled)
-        st.session_state[preview_key] = previews
-        st.session_state[signature_key] = signatures
-        st.rerun()
+    approve_all_col.button("확인된 요청 모두 승인", key="approve_all_steps", disabled=True)
     if missing_preview_ids:
         st.caption("전체 승인은 화면에 표시된 결과만 대상으로 합니다. 먼저 확인 가능한 요청을 모두 살펴보세요.")
+    else:
+        st.caption("연결된 요청은 앞 요청 승인 후 후속 결과가 바뀔 수 있으므로 요청별로 순서대로 승인하세요.")
 
 
 def main() -> None:

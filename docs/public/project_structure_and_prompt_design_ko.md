@@ -173,7 +173,7 @@ flowchart TD
 flowchart LR
     Input["User Input\nselection_text\nmodification_text\nstored_rules"]
     Metadata["Metadata\ntable_columns\nsource_channel_values\nsource_channel_mappings\ncolumn_alias_mappings\nmetric_definitions\nprotected_column_policies\ncolumn_catalog\nvalue_catalog\nschema_summary"]
-    IR["IR\nir_structured_json\nselection_request\nmodification_logic\nworkflow_steps"]
+    IR["IR\nir_structured_json\nselection_request\nmodification_logic\nworkflow_steps\nlinked_step_plan\nlinked_step_validation\nlinked_step_results"]
     Rec["Recommendations\nquery_recommendations\nresolution_candidates"]
     Selection["Selection\nselection_sql_plan\nselection_validation_result\ntarget_rows"]
     SQL["SQL Candidate\neffective_modification_plan\nprecompiled_where\nsql_candidate\nparsed_sql\nvalidation_result"]
@@ -183,7 +183,7 @@ flowchart LR
     Input --> Metadata --> IR --> Rec --> Selection --> SQL --> Preview --> Result
 ```
 
-State에 들어온 LLM 결과는 실행 가능한 명령이 아니다. 후속 deterministic compiler와 validator가 live schema 기준으로 다시 검증해야 한다.
+State에 들어온 LLM 결과는 실행 가능한 명령이 아니다. 후속 deterministic compiler와 validator가 live schema 기준으로 다시 검증해야 한다. 연계 요청은 기존 `workflow_steps`와 별도로 `linked_step_plan`, `linked_step_validation`, `linked_step_results` artifact를 통해 step 순서와 dependency 구조를 보존한다.
 
 ## 8. DB Metadata와 Dictionary 흐름
 

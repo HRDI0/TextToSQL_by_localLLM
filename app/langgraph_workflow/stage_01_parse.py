@@ -473,6 +473,101 @@ def build_workflow_steps(modification: dict[str, Any]) -> list[dict[str, Any]]:
     return steps
 
 
+def build_linked_step_plan(selection: dict[str, Any], modification: dict[str, Any]) -> list[dict[str, Any]]:
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    selection_scope = {
+        "customer": selection.get("customer", "default"),
+        "tables": list(selection.get("tables", [])),
+        "source_channels": list(selection.get("source_channels", [])),
+        "period": selection.get("period", {}),
+    }
+    plan: list[dict[str, Any]] = []
+    for index, group in enumerate(groups):
+        step_id = str(group.get("group_id") or f"step_{index + 1}")
+        depends_on = [str(item) for item in group.get("depends_on", [])]
+        dependency = "dependent" if depends_on or group.get("dependency") == "dependent" else "independent"
+        plan.append(
+            {
+                "step_id": step_id,
+                "group_id": step_id,
+                "step_order": index + 1,
+                "intent_type": group.get("intent_type"),
+                "dependency": dependency,
+                "depends_on": depends_on,
+                "selection_scope": selection_scope,
+                "conditions": group.get("conditions", []),
+                "actions": group.get("actions", []),
+                "group_by": group.get("group_by", []),
+                "metrics": group.get("metrics", []),
+                "derived_column": group.get("derived_column", {}),
+                "expected_artifacts": ["sql_candidate", "validation_result", "change_preview_json", "user_confirmation"],
+                "execution_gate": "preview_first_approval_required",
+                "status": "planned" if dependency == "independent" or depends_on else "blocked",
+            }
+        )
+    return plan
+
+
+def validate_linked_step_plan(plan: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(plan) <= 1:
+        return {
+            "status": "not_applicable",
+            "checks": ["single_step_or_no_linked_plan"],
+            "warnings": [],
+            "errors": [],
+            "step_count": len(plan),
+            "dependent_step_count": 0,
+        }
+
+    checks: list[str] = []
+    warnings: list[str] = []
+    errors: list[str] = []
+    known = {str(step.get("step_id")) for step in plan if step.get("step_id")}
+    step_ids = [str(step.get("step_id")) for step in plan if step.get("step_id")]
+    duplicate_step_ids = sorted({step_id for step_id in step_ids if step_ids.count(step_id) > 1})
+    for duplicate_step_id in duplicate_step_ids:
+        errors.append(f"linked_step_duplicate_id:{duplicate_step_id}")
+    seen: set[str] = set()
+    dependent_step_count = 0
+    for step in plan:
+        step_id = str(step.get("step_id") or "")
+        dependency = str(step.get("dependency") or "independent")
+        depends_on = [str(item) for item in step.get("depends_on", [])]
+        if dependency == "dependent":
+            dependent_step_count += 1
+        if not step_id:
+            errors.append("linked_step_id_missing")
+            continue
+        if step_id in depends_on:
+            errors.append(f"linked_step_self_dependency:{step_id}")
+        missing = [item for item in depends_on if item not in known]
+        if missing:
+            errors.append(f"linked_step_missing_dependency:{step_id}:{missing}")
+        future = [item for item in depends_on if item in known and item not in seen]
+        if future:
+            errors.append(f"linked_step_dependency_order_violation:{step_id}:{future}")
+        if dependency == "dependent" and not depends_on:
+            errors.append(f"linked_step_dependent_without_depends_on:{step_id}")
+        if dependency == "independent" and depends_on:
+            warnings.append(f"linked_step_independent_has_depends_on:{step_id}")
+        seen.add(step_id)
+
+    if dependent_step_count:
+        checks.append("dependent_steps_declared")
+    else:
+        warnings.append("multi_step_plan_has_no_declared_dependencies")
+    if not errors:
+        checks.append("linked_step_dependencies_valid")
+    return {
+        "status": "passed" if not errors else "failed",
+        "checks": checks,
+        "warnings": warnings,
+        "errors": errors,
+        "step_count": len(plan),
+        "dependent_step_count": dependent_step_count,
+    }
+
+
 def match_media_source_channels(
     text: str,
     source_channel_values: dict[str, list[str]],
@@ -725,9 +820,13 @@ def parse_ir_request_node(state: ModificationWorkflowState, llm: Any = None) -> 
     ir_structured_json = coerce_numeric_presence_conditions(ir_structured_json, f"{state['selection_text']} {state['modification_text']}")
     ir_structured_json["selection"]["intent_type"] = ir_structured_json.get("intent_type")
     ir_structured_json["modification"]["intent_type"] = ir_structured_json.get("intent_type")
+    workflow_steps = build_workflow_steps(ir_structured_json["modification"])
+    linked_step_plan = build_linked_step_plan(ir_structured_json["selection"], ir_structured_json["modification"])
     return {
         "selection_request": ir_structured_json["selection"],
         "modification_logic": ir_structured_json["modification"],
         "ir_structured_json": ir_structured_json,
-        "workflow_steps": build_workflow_steps(ir_structured_json["modification"]),
+        "workflow_steps": workflow_steps,
+        "linked_step_plan": linked_step_plan,
+        "linked_step_validation": validate_linked_step_plan(linked_step_plan),
     }

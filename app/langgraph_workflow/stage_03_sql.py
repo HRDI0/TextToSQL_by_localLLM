@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, cast
 
 from app.langgraph_workflow.db import build_schema_summary, quote_identifier
 from app.langgraph_workflow.import_rules import resolve_column_from_import_rules
@@ -66,6 +66,49 @@ def is_numeric_literal(value: Any) -> bool:
 
 def numeric_sql(column: str) -> str:
     return f"CAST(NULLIF({quote_identifier(column)}, '') AS DECIMAL(18,2))"
+
+
+def overlay_delta_items_for_table(state: ModificationWorkflowState, target_table: str) -> list[dict[str, Any]]:
+    context = state.get("effective_preview_context", {})
+    items = context.get("delta_items", []) if isinstance(context, dict) else []
+    return [item for item in items if isinstance(item, dict) and item.get("target_table") == target_table and item.get("source_row_id") not in {None, ""}]
+
+
+def effective_table_source_sql(
+    target_table: str,
+    columns: list[str],
+    delta_items: list[dict[str, Any]],
+) -> tuple[str, list[Any], list[str]]:
+    if not delta_items:
+        return quote_identifier(target_table), [], []
+
+    values_by_column: dict[str, dict[Any, Any]] = {}
+    for item in delta_items:
+        after = item.get("after", {})
+        if not isinstance(after, dict):
+            continue
+        row_id = item.get("source_row_id")
+        for column, value in after.items():
+            if column not in columns:
+                continue
+            values_by_column.setdefault(str(column), {})[row_id] = value
+    if not values_by_column:
+        return quote_identifier(target_table), [], []
+
+    select_parts: list[str] = []
+    params: list[Any] = []
+    for column in columns:
+        row_values = values_by_column.get(column)
+        if not row_values:
+            select_parts.append(quote_identifier(column))
+            continue
+        cases: list[str] = []
+        for row_id, value in row_values.items():
+            cases.append("WHEN %s THEN %s")
+            params.extend([row_id, value])
+        select_parts.append(f"CASE {quote_identifier('row_id')} {' '.join(cases)} ELSE {quote_identifier(column)} END AS {quote_identifier(column)}")
+    source_sql = f"(SELECT {', '.join(select_parts)} FROM {quote_identifier(target_table)}) AS effective_source"
+    return source_sql, params, unique_preserve_order(list(values_by_column.keys()))
 
 
 def column_sql_for_comparison(column: str, values: list[Any]) -> str:
@@ -479,6 +522,51 @@ def recover_or_conditions_from_text(modification_logic: dict[str, Any], text: st
     return {**modification_logic, "condition_groups": recovered_groups}
 
 
+def condition_resolves_to_live_column(
+    condition: dict[str, Any],
+    table_name: str,
+    table_columns: dict[str, list[str]],
+    column_alias_mappings: list[dict[str, Any]] | None = None,
+) -> bool:
+    if condition.get("operator") == "or":
+        return any(
+            condition_resolves_to_live_column(item, table_name, table_columns, column_alias_mappings)
+            for item in condition.get("conditions", [])
+            if isinstance(item, dict)
+        )
+    field = str(condition.get("field") or condition.get("column") or "")
+    resolved = resolve_workflow_column(field, table_name, table_columns, column_alias_mappings)
+    return resolved in table_columns.get(table_name, [])
+
+
+def filter_read_only_live_conditions(
+    modification_logic: dict[str, Any],
+    selection_request: dict[str, Any],
+    table_columns: dict[str, list[str]],
+    column_alias_mappings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    table_name = selection_request.get("tables", ["SA"])[0]
+    filtered_groups: list[dict[str, Any]] = []
+    for group in modification_logic.get("condition_groups", []):
+        filtered_conditions: list[dict[str, Any]] = []
+        for condition in group.get("conditions", []):
+            if not isinstance(condition, dict):
+                continue
+            if condition.get("operator") == "or":
+                live_nested = [
+                    item
+                    for item in condition.get("conditions", [])
+                    if isinstance(item, dict) and condition_resolves_to_live_column(item, table_name, table_columns, column_alias_mappings)
+                ]
+                if live_nested:
+                    filtered_conditions.append({**condition, "conditions": live_nested})
+                continue
+            if condition_resolves_to_live_column(condition, table_name, table_columns, column_alias_mappings):
+                filtered_conditions.append(condition)
+        filtered_groups.append({**group, "conditions": filtered_conditions})
+    return {**modification_logic, "condition_groups": filtered_groups}
+
+
 def compile_selection_scope_to_where(
     selection_request: dict[str, Any],
     table_columns: dict[str, list[str]],
@@ -550,6 +638,14 @@ def read_only_conditions_to_where(state: ModificationWorkflowState, table_column
     modification_logic = normalize_condition_values_from_rows(state.get("modification_logic", {}), state.get("target_rows", []))
     modification_logic = recover_condition_values_from_text(modification_logic, state.get("modification_text", ""))
     modification_logic = recover_or_conditions_from_text(modification_logic, state.get("modification_text", ""))
+    filtered_logic = filter_read_only_live_conditions(
+        modification_logic,
+        selection_request,
+        table_columns,
+        state.get("column_alias_mappings", []),
+    )
+    if any(group.get("conditions") for group in filtered_logic.get("condition_groups", []) if isinstance(group, dict)):
+        modification_logic = filtered_logic
     try:
         return compile_conditions_to_where(
             modification_logic,
@@ -653,6 +749,33 @@ def actions_to_set_clause(
     if not clauses:
         raise ValueError("No requested modification action found.")
     return ", ".join(clauses), params, target_fields, normalized_actions
+
+
+def is_derived_label_field_name(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return False
+    return any(token in text for token in ["분류값", "분류 값", "구분값", "구분 값", "상태값", "상태 값", "확인 값"])
+
+
+def should_render_update_as_derived_value(
+    modification_logic: dict[str, Any],
+    modification_text: str,
+    target_table: str,
+    table_columns: dict[str, list[str]],
+    column_alias_mappings: list[dict[str, Any]] | None = None,
+) -> bool:
+    text = str(modification_text or "")
+    if not any(token in text for token in ["붙", "기입", "분류", "만들", "새 컬럼", "새 구분", "새 항목"]):
+        return False
+    for action in iter_actions(modification_logic):
+        raw_target = action.get("target_field") or action.get("target_column") or ""
+        if not is_derived_label_field_name(raw_target):
+            continue
+        resolved_target = resolve_workflow_column(raw_target, target_table, table_columns, column_alias_mappings)
+        if resolved_target not in table_columns.get(target_table, []):
+            return True
+    return False
 
 
 def build_blocked_sql_candidate(reason: str, target_table: str | None = None) -> dict[str, Any]:
@@ -1091,21 +1214,24 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         metric_params.extend(expression_params)
 
     where_sql = precompiled_where.get("sql", "1 = 1")
+    delta_items = overlay_delta_items_for_table(state, target_table)
+    source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, delta_items)
     group_sql = ""
     if group_by_columns:
         group_sql = " GROUP BY " + ", ".join(quote_identifier(column) for column in group_by_columns)
-    sql = f"SELECT {', '.join(select_parts)} FROM {quote_identifier(target_table)} WHERE {where_sql}{group_sql}"
-    params = [*metric_params, *precompiled_where.get("params", [])]
+    sql = f"SELECT {', '.join(select_parts)} FROM {source_sql} WHERE {where_sql}{group_sql}"
+    params = [*metric_params, *overlay_params, *precompiled_where.get("params", [])]
     return {
         "source": "deterministic_select_aggregate_renderer",
         "sql_type": "SELECT",
         "sql": sql,
         "params": params,
-        "referenced_columns": unique_preserve_order(referenced_columns),
+        "referenced_columns": unique_preserve_order([*referenced_columns, *overlay_columns]),
         "target_table": target_table,
-        "reason": "intent_type=SELECT_AGGREGATE; deterministic code rendered aggregate SELECT from IR and live schema.",
+        "reason": "intent_type=SELECT_AGGREGATE; deterministic code rendered aggregate SELECT from IR, live schema, and linked-step overlay deltas.",
         "actions": [],
         "predicate": precompiled_where.get("predicate", []),
+        "overlay_delta_count": len(delta_items),
         "sql_fingerprint": fingerprint_sql(sql, params),
     }
 
@@ -1120,18 +1246,21 @@ def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_co
     modification_where = read_only_conditions_to_where(state, table_columns)
     precompiled_where = combine_where_predicates(selection_where, modification_where)
     where_sql = precompiled_where.get("sql", "1 = 1")
-    params = list(precompiled_where.get("params", []))
-    sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}"
+    delta_items = overlay_delta_items_for_table(state, target_table)
+    source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, delta_items)
+    params = [*overlay_params, *precompiled_where.get("params", [])]
+    sql = f"SELECT * FROM {source_sql} WHERE {where_sql}"
     return {
         "source": "deterministic_select_detail_renderer",
         "sql_type": "SELECT",
         "sql": sql,
         "params": params,
-        "referenced_columns": unique_preserve_order(precompiled_where.get("columns", [])),
+        "referenced_columns": unique_preserve_order([*precompiled_where.get("columns", []), *overlay_columns]),
         "target_table": target_table,
-        "reason": "intent_type=SELECT_DETAIL; rendered row-level SELECT inside the first requested scope.",
+        "reason": "intent_type=SELECT_DETAIL; rendered row-level SELECT inside the first requested scope with linked-step overlay deltas.",
         "actions": [],
         "predicate": precompiled_where.get("predicate", []),
+        "overlay_delta_count": len(delta_items),
         "sql_fingerprint": fingerprint_sql(sql, params),
     }
 
@@ -1363,6 +1492,25 @@ def generate_or_reuse_sql_node(state: ModificationWorkflowState, llm: Any = None
         modification_logic = recover_or_conditions_from_text(modification_logic, state.get("modification_text", ""))
         column_alias_mappings = state.get("column_alias_mappings", [])
         protected_column_policies = state.get("protected_column_policies", [])
+        if should_render_update_as_derived_value(
+            modification_logic,
+            state.get("modification_text", ""),
+            target_table,
+            table_columns,
+            column_alias_mappings,
+        ):
+            derived_state = cast(ModificationWorkflowState, {**state, "modification_logic": modification_logic})
+            sql_candidate = build_derived_value_insert_sql_candidate(derived_state, table_columns)
+            return {
+                "modification_logic": modification_logic,
+                "precompiled_where": {
+                    "sql": sql_candidate.get("where_sql", "1 = 1"),
+                    "params": sql_candidate.get("where_params", []),
+                    "columns": sql_candidate.get("referenced_columns", []),
+                    "predicate": sql_candidate.get("predicate", []),
+                },
+                "sql_candidate": sql_candidate,
+            }
         requested_target_fields = requested_action_columns_from_text(
             state.get("modification_text", ""),
             target_table,
@@ -1526,6 +1674,11 @@ def parse_sql_with_script(sql: str) -> dict[str, Any]:
         flags=re.IGNORECASE,
     )
     select_match = re.fullmatch(r"SELECT\s+.+\s+FROM\s+`([^`]+)`\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+)?", stripped, flags=re.IGNORECASE)
+    overlay_select_match = re.fullmatch(
+        r"SELECT\s+.+\s+FROM\s+\(SELECT\s+.+\s+FROM\s+`([^`]+)`\)\s+AS\s+effective_source\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+)?",
+        stripped,
+        flags=re.IGNORECASE,
+    )
 
     if update_match:
         table_name = update_match.group(1)
@@ -1561,9 +1714,12 @@ def parse_sql_with_script(sql: str) -> dict[str, Any]:
             "broad_predicate": where_sql.strip() == "1 = 1",
             "has_dangerous_tokens": has_dangerous_tokens,
         }
-    if select_match:
-        table_name = select_match.group(1)
-        where_sql = select_match.group(2)
+    if select_match or overlay_select_match:
+        match = select_match or overlay_select_match
+        if match is None:
+            raise ValueError("Unsupported SELECT shape for deterministic tutorial parser.")
+        table_name = match.group(1)
+        where_sql = match.group(2)
         if where_sql.strip() != "1 = 1":
             parse_where_clause(where_sql)
         identifiers = re.findall(r"`([^`]+)`", stripped)
