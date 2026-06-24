@@ -1,0 +1,158 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1180" viewBox="0 0 1680 1180" role="img" aria-labelledby="title desc">
+  <title id="title">Preview-first LangGraph SQL workflow architecture</title>
+  <desc id="desc">A public-safe architecture diagram showing runtime inputs, LangGraph stages, metadata, linked-step delta overlay, preview approval, backup-protected execution, and test artifacts.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/></marker>
+    <style>
+      .bg{fill:#f8fafc}.lane{fill:#eef2ff;stroke:#c7d2fe;stroke-width:2}.node{fill:#fff;stroke:#334155;stroke-width:2;rx:14;ry:14}.io{fill:#ecfeff;stroke:#0891b2;stroke-width:2;rx:14;ry:14}.db{fill:#fef3c7;stroke:#d97706;stroke-width:2;rx:14;ry:14}.llm{fill:#fce7f3;stroke:#be185d;stroke-width:2;rx:14;ry:14}.safe{fill:#dcfce7;stroke:#16a34a;stroke-width:2;rx:14;ry:14}.warn{fill:#fee2e2;stroke:#dc2626;stroke-width:2;rx:14;ry:14}.edge{stroke:#334155;stroke-width:2.5;fill:none;marker-end:url(#arrow)}.soft{stroke:#64748b;stroke-width:2;stroke-dasharray:8 6;fill:none;marker-end:url(#arrow)}.label{font:700 18px sans-serif;fill:#0f172a}.text{font:14px sans-serif;fill:#334155}.small{font:12px sans-serif;fill:#475569}.lane-title{font:700 20px sans-serif;fill:#312e81}
+    </style>
+  </defs>
+  <rect class="bg" width="1680" height="1180"/>
+
+  <rect class="lane" x="40" y="40" width="330" height="1080"/>
+  <rect class="lane" x="405" y="40" width="610" height="1080"/>
+  <rect class="lane" x="1050" y="40" width="590" height="1080"/>
+  <text class="lane-title" x="70" y="78">Runtime Inputs</text>
+  <text class="lane-title" x="435" y="78">Compiled LangGraph</text>
+  <text class="lane-title" x="1080" y="78">State, Safety, Outputs</text>
+
+  <rect class="io" x="80" y="120" width="250" height="88"/>
+  <text class="label" x="105" y="152">Streamlit Review UI</text>
+  <text class="small" x="105" y="178">manual preview, approve, reject</text>
+
+  <rect class="io" x="80" y="242" width="250" height="88"/>
+  <text class="label" x="105" y="274">Markdown Test Runner</text>
+  <text class="small" x="105" y="300">approved=false, preview-only</text>
+
+  <rect class="llm" x="80" y="364" width="250" height="100"/>
+  <text class="label" x="105" y="396">LLM Provider</text>
+  <text class="small" x="105" y="422">local OpenAI-compatible</text>
+  <text class="small" x="105" y="444">or Gemini-compatible client</text>
+
+  <rect class="db" x="80" y="500" width="250" height="112"/>
+  <text class="label" x="105" y="532">MariaDB Metadata</text>
+  <text class="small" x="105" y="558">staging table schema</text>
+  <text class="small" x="105" y="580">business dictionaries</text>
+  <text class="small" x="105" y="602">recommendation catalogs</text>
+
+  <rect class="node" x="455" y="115" width="240" height="70"/>
+  <text class="label" x="480" y="146">START</text>
+  <text class="small" x="480" y="168">workflow state</text>
+
+  <rect class="db" x="455" y="220" width="240" height="78"/>
+  <text class="label" x="480" y="250">Load Metadata</text>
+  <text class="small" x="480" y="276">live schema + dictionaries</text>
+
+  <rect class="llm" x="455" y="333" width="240" height="88"/>
+  <text class="label" x="480" y="363">Stage 01 Parse</text>
+  <text class="small" x="480" y="389">IR, intent, linked steps</text>
+
+  <rect class="node" x="455" y="456" width="240" height="78"/>
+  <text class="label" x="480" y="486">Recommendations</text>
+  <text class="small" x="480" y="512">ambiguous term candidates</text>
+
+  <rect class="node" x="455" y="569" width="240" height="78"/>
+  <text class="label" x="480" y="599">Selection SQL</text>
+  <text class="small" x="480" y="625">scoped read candidate</text>
+
+  <rect class="safe" x="455" y="682" width="240" height="78"/>
+  <text class="label" x="480" y="712">Selection Validate</text>
+  <text class="small" x="480" y="738">allowed tables + live values</text>
+
+  <rect class="db" x="455" y="795" width="240" height="78"/>
+  <text class="label" x="480" y="825">Fetch Target Rows</text>
+  <text class="small" x="480" y="851">sample for preview</text>
+
+  <rect class="node" x="455" y="908" width="240" height="78"/>
+  <text class="label" x="480" y="938">Stage 02 Rule Lookup</text>
+  <text class="small" x="480" y="964">placeholder reusable rules</text>
+
+  <rect class="node" x="735" y="220" width="240" height="92"/>
+  <text class="label" x="760" y="250">Stage 03 SQL</text>
+  <text class="small" x="760" y="276">SELECT / UPDATE / derived</text>
+  <text class="small" x="760" y="296">COUNT and aggregates</text>
+
+  <rect class="safe" x="735" y="347" width="240" height="92"/>
+  <text class="label" x="760" y="377">SQL Validation</text>
+  <text class="small" x="760" y="403">columns, params, tokens</text>
+  <text class="small" x="760" y="423">overlay write restrictions</text>
+
+  <rect class="db" x="735" y="474" width="240" height="92"/>
+  <text class="label" x="760" y="504">Stage 04 Output</text>
+  <text class="small" x="760" y="530">sample rows + before/after</text>
+  <text class="small" x="760" y="550">preview fingerprint</text>
+
+  <rect class="safe" x="735" y="601" width="240" height="92"/>
+  <text class="label" x="760" y="631">Confirmation Gate</text>
+  <text class="small" x="760" y="657">approval + fingerprint match</text>
+  <text class="small" x="760" y="677">otherwise skipped</text>
+
+  <rect class="warn" x="735" y="728" width="240" height="100"/>
+  <text class="label" x="760" y="758">Guarded Execute</text>
+  <text class="small" x="760" y="784">backup before raw UPDATE</text>
+  <text class="small" x="760" y="804">derived preview can skip</text>
+
+  <rect class="io" x="735" y="863" width="240" height="80"/>
+  <text class="label" x="760" y="893">Output JSON</text>
+  <text class="small" x="760" y="919">UI/report artifacts</text>
+
+  <rect class="node" x="735" y="978" width="240" height="70"/>
+  <text class="label" x="760" y="1008">END</text>
+
+  <rect class="db" x="1090" y="120" width="250" height="105"/>
+  <text class="label" x="1115" y="152">Linked Delta Store</text>
+  <text class="small" x="1115" y="178">approved dependency deltas</text>
+  <text class="small" x="1115" y="200">joined by plan, step, row</text>
+
+  <rect class="safe" x="1360" y="120" width="250" height="105"/>
+  <text class="label" x="1385" y="152">Effective Source</text>
+  <text class="small" x="1385" y="178">raw + approved overlay</text>
+  <text class="small" x="1385" y="200">no row-level CASE list</text>
+
+  <rect class="safe" x="1090" y="270" width="250" height="118"/>
+  <text class="label" x="1115" y="302">Preview-Only Paths</text>
+  <text class="small" x="1115" y="328">test runner approved=false</text>
+  <text class="small" x="1115" y="350">intermediate step approval</text>
+  <text class="small" x="1115" y="372">does not mutate raw rows</text>
+
+  <rect class="warn" x="1360" y="270" width="250" height="118"/>
+  <text class="label" x="1385" y="302">Backup Gate</text>
+  <text class="small" x="1385" y="328">final raw UPDATE only</text>
+  <text class="small" x="1385" y="350">backup coverage required</text>
+  <text class="small" x="1385" y="372">fail closed if missing</text>
+
+  <rect class="io" x="1090" y="435" width="520" height="115"/>
+  <text class="label" x="1115" y="467">Markdown Reports</text>
+  <text class="small" x="1115" y="493">query PASS: validation + preview</text>
+  <text class="small" x="1115" y="515">semantic PASS: human review of request, SQL, samples</text>
+  <text class="small" x="1115" y="537">public docs report sanitized aggregate outcomes only</text>
+
+  <path class="edge" d="M330 164 C385 164 400 150 455 150"/>
+  <path class="edge" d="M330 286 C385 286 400 150 455 150"/>
+  <path class="soft" d="M330 414 C390 414 405 377 455 377"/>
+  <path class="soft" d="M330 556 C390 556 405 259 455 259"/>
+
+  <path class="edge" d="M575 185 L575 220"/>
+  <path class="edge" d="M575 298 L575 333"/>
+  <path class="edge" d="M575 421 L575 456"/>
+  <path class="edge" d="M575 534 L575 569"/>
+  <path class="edge" d="M575 647 L575 682"/>
+  <path class="edge" d="M575 760 L575 795"/>
+  <path class="edge" d="M575 873 L575 908"/>
+  <path class="edge" d="M695 947 C720 947 720 266 735 266"/>
+  <path class="edge" d="M855 312 L855 347"/>
+  <path class="edge" d="M855 439 L855 474"/>
+  <path class="edge" d="M855 566 L855 601"/>
+  <path class="edge" d="M855 693 L855 728"/>
+  <path class="edge" d="M855 828 L855 863"/>
+  <path class="edge" d="M855 943 L855 978"/>
+
+  <path class="soft" d="M975 520 C1035 500 1055 180 1090 172"/>
+  <path class="soft" d="M1340 172 L1360 172"/>
+  <path class="soft" d="M1360 200 C1210 230 1045 280 975 266"/>
+  <path class="soft" d="M975 647 C1035 647 1045 326 1090 326"/>
+  <path class="soft" d="M975 778 C1050 778 1280 340 1360 340"/>
+  <path class="soft" d="M975 903 C1035 903 1055 492 1090 492"/>
+
+  <text class="small" x="70" y="1138">Public-safe view: private source values, prompts, row samples, credentials, and local paths are intentionally omitted.</text>
+</svg>

@@ -445,7 +445,7 @@ LLM 요청은 IR 구조화와 UPDATE action-plan 생성에만 사용한다. SQL 
 | 검수 대상 | 권장 경로 |
 | --- | --- |
 | DB 연결과 row count | `scripts/query_db.py`의 read-only command |
-| 수동 적용 전 확인/확정 | `streamlit run app/streamlit_langgraph_test.py` 또는 wrapper script |
+| 수동 적용 전 확인/확정 | `bash scripts/run_streamlit.sh` |
 | 여러 자연어 case review | `scripts/run_langgraph_test_cases.py` |
 | 문서 공개 안전성 | `docs/public/` 내부 문서만 commit 대상인지 확인 |
 

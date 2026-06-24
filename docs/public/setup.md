@@ -48,9 +48,11 @@ Do not add source files, extracted archives, generated exports, or database back
 ## Manual Workflow UI
 
 ```bash
-streamlit run app/streamlit_langgraph_test.py
+bash scripts/run_streamlit.sh
 ```
 
 The UI is intended for local review and confirmation testing. Do not capture screenshots containing private data for public documentation.
 
 The default LLM client uses a local OpenAI-compatible endpoint. If you use an external provider, keep API keys in an ignored local `.env` file or enter them only in the local admin session. Do not commit keys, private endpoint names, model files, or screenshots with source data.
+
+When refreshing public screenshots, restart the local UI first and capture only generic screens that do not expose raw source rows, private prompts, credentials, file names, or production identifiers.

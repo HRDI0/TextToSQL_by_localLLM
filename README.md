@@ -80,7 +80,7 @@ python3 scripts/query_db.py sql "SELECT COUNT(*) AS rows FROM <table_name>"
 Run the manual workflow UI:
 
 ```bash
-streamlit run app/streamlit_langgraph_test.py
+bash scripts/run_streamlit.sh
 ```
 
 The UI first fixes the requested data scope, then applies follow-up conditions or calculations inside that scope. The default LLM connection is the local OpenAI-compatible llama.cpp endpoint; optional provider/model selection is available in the local admin controls without committing secrets.
@@ -125,7 +125,7 @@ Stop local services when needed:
 
 ```bash
 pkill -f '<local_llama_server_process_pattern>'
-pkill -f 'streamlit run app/streamlit_langgraph_test.py'
+pkill -f 'scripts/run_streamlit.sh|streamlit.*app/streamlit_langgraph_test.py'
 ```
 
 ## Safety Model

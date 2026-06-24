@@ -38,6 +38,18 @@ DEFAULT_LLM_MODEL = "qwen3-14b"
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 LOGGER = logging.getLogger(__name__)
+WORKFLOW_SESSION_KEYS = {
+    "pipeline_result",
+    "last_valid_input",
+    "linked_plan_id",
+    "accepted_step_ids",
+    "cancelled_step_ids",
+    "step_preview_results",
+    "step_preview_signatures",
+    "step_invalidated_previews",
+    "linked_final_execution_results",
+}
+INPUT_SESSION_KEYS = {"selection_text", "modification_text", "stored_rules_json"}
 
 
 def has_streamlit_context() -> bool:
@@ -52,6 +64,23 @@ def session_value(key: str, default: Any = None) -> Any:
     if not has_streamlit_context():
         return default
     return st.session_state.get(key, default)
+
+
+def clear_workflow_state(clear_inputs: bool = False) -> None:
+    for key in WORKFLOW_SESSION_KEYS:
+        st.session_state.pop(key, None)
+    if clear_inputs:
+        for key in INPUT_SESSION_KEYS:
+            st.session_state[key] = ""
+
+
+def reset_to_initial_state() -> None:
+    clear_workflow_state(clear_inputs=True)
+
+
+def clear_results_on_input_change() -> None:
+    if st.session_state.get("pipeline_result"):
+        clear_workflow_state(clear_inputs=False)
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -248,7 +277,7 @@ def show_final_result(result: dict[str, Any]) -> None:
     if affected_count is not None or shown_count is not None:
         st.caption(f"대상 데이터 {affected_count or 0}건 중 화면 표시 {shown_count or 0}건입니다.")
     if sample_rows:
-        st.dataframe(sample_rows, use_container_width=True)
+        st.dataframe(sample_rows, width="stretch")
     else:
         st.info("표시할 샘플 데이터가 없습니다.")
 
@@ -686,13 +715,21 @@ def step_is_available(step: dict[str, Any], accepted_step_ids: set[str], cancell
 def show_recommendations(result: dict[str, Any]) -> None:
     recommendations = result.get("query_recommendations") or result.get("output_json", {}).get("query_recommendations", [])
     if not recommendations:
+        st.caption("추천 조건이 있으면 여기에 표시됩니다.")
         return
     st.subheader("추천 조건")
-    st.caption("원하는 결과가 아니면 아래 추천 조건으로 다시 확인할 수 있습니다. 추천은 자동 적용되지 않습니다.")
+    st.caption("원하는 결과가 아니면 쉬운 표현으로 바꿔 다시 확인할 수 있습니다. 추천은 자동 적용되지 않습니다.")
     last_input = st.session_state.get("last_valid_input", {})
     for index, item in enumerate(recommendations[:5]):
-        st.info(item.get("recommendation_text") or f"{item.get('original_term')} -> {item.get('recommended_term')}")
-        if st.button("추천 조건으로 다시 확인", key=f"recommendation_preview_{index}"):
+        original = str(item.get("original_term") or "").strip()
+        recommended = str(item.get("recommended_term") or item.get("recommendation_text") or "").strip()
+        label = recommended or "추천 조건"
+        st.markdown(f"**{index + 1}. {label}**")
+        if original:
+            st.caption(f"입력한 표현 '{original}'을 더 잘 맞는 조건으로 다시 확인합니다.")
+        with st.expander("자세한 추천 내용", expanded=False):
+            st.write(item.get("recommendation_text") or label)
+        if st.button("이 조건으로 다시 확인", key=f"recommendation_preview_{index}", width="stretch"):
             updated_selection = last_input.get("selection_text", "")
             updated_modification = last_input.get("modification_text", "")
             if item.get("input_origin") == "selection":
@@ -709,6 +746,8 @@ def show_recommendations(result: dict[str, Any]) -> None:
             st.session_state.accepted_step_ids = []
             st.session_state.cancelled_step_ids = []
             st.session_state.step_preview_results = {}
+            st.session_state.step_preview_signatures = {}
+            st.session_state.step_invalidated_previews = {}
             st.rerun()
 
 
@@ -789,7 +828,7 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
             status_label = "확인 가능"
         else:
             status_label = "앞 요청 대기"
-        with st.expander(f"요청 {index} · {status_label}", expanded=step_id not in accepted and step_id not in cancelled):
+        with st.expander(f"요청 {index} · {status_label}", expanded=available and step_id not in accepted and step_id not in cancelled):
             related_ids = sorted(step_ids_to_invalidate(steps, step_id) - {step_id})
             if step.get("depends_on"):
                 st.caption(f"이 요청은 앞 요청 {', '.join(str(item) for item in step.get('depends_on', []))} 결과를 바탕으로 계산됩니다.")
@@ -807,7 +846,8 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                     st.warning("다시 확인한 결과가 이전과 달라졌습니다.")
                 elif changed is False:
                     st.caption("다시 확인한 결과가 이전과 같습니다.")
-            st.json({"depends_on": step.get("depends_on", []), "conditions": step.get("conditions", []), "actions": step.get("actions", [])})
+            with st.expander("요청 조건 자세히 보기", expanded=False):
+                st.json({"depends_on": step.get("depends_on", []), "conditions": step.get("conditions", []), "actions": step.get("actions", [])})
             available = step_is_available(step, accepted, cancelled)
             current_signature = preview_signature(step_id, steps, accepted, cancelled)
             preview_ready = step_id in previews and signatures.get(step_id) == current_signature and preview_can_be_approved(previews.get(step_id))
@@ -922,15 +962,32 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    st.set_page_config(layout="wide")
     st.title("광고 데이터 적용 전 확인")
     st.caption("사용자가 입력한 마케팅 요청을 해석하고, 원본을 바꾸기 전에 샘플 데이터로 먼저 확인하는 화면입니다.")
     show_llm_admin_controls()
 
-    with st.form("pipeline_input_form"):
-        selection_text = st.text_area("어떤 광고 데이터를 볼까요?", value="", placeholder=SELECTION_PLACEHOLDER, key="selection_text")
-        modification_text = st.text_area("무엇을 바꾸거나 계산할까요?", value="", placeholder=MODIFICATION_PLACEHOLDER, key="modification_text")
-        stored_rules_json = st.text_area("저장된 규칙 입력 (개발용)", value="", placeholder=STORED_RULES_PLACEHOLDER, key="stored_rules_json")
-        submitted = st.form_submit_button("적용 전 결과 확인")
+    main_col, side_col = st.columns([0.78, 0.22], gap="large")
+    with main_col:
+        selection_text = st.text_area(
+            "어떤 광고 데이터를 볼까요?",
+            placeholder=SELECTION_PLACEHOLDER,
+            key="selection_text",
+            on_change=clear_results_on_input_change,
+        )
+        modification_text = st.text_area(
+            "무엇을 바꾸거나 계산할까요?",
+            placeholder=MODIFICATION_PLACEHOLDER,
+            key="modification_text",
+            on_change=clear_results_on_input_change,
+        )
+        stored_rules_json = st.text_area(
+            "저장된 규칙 입력 (개발용)",
+            placeholder=STORED_RULES_PLACEHOLDER,
+            key="stored_rules_json",
+            on_change=clear_results_on_input_change,
+        )
+        submitted = st.button("적용 전 결과 확인", key="submit_preview")
 
     if submitted:
         try:
@@ -964,35 +1021,43 @@ def main() -> None:
             st.error("요청을 확인하는 중 문제가 발생했습니다. 관리자에게 로그 확인을 요청하세요.")
 
     result = st.session_state.get("pipeline_result")
+    with side_col:
+        st.button("처음으로 돌아가기", key="reset_to_initial", width="stretch", on_click=reset_to_initial_state)
+        st.divider()
+        if result:
+            show_recommendations(result)
+        else:
+            st.caption("추천 조건이 있으면 여기에 표시됩니다.")
+
     if not result:
-        st.info("적용 전 결과 확인 버튼을 누르면 요청 해석 결과, 실제 적용 전 명령, 샘플 데이터를 확인할 수 있습니다.")
+        with main_col:
+            st.info("적용 전 결과 확인 버튼을 누르면 요청 해석 결과, 실제 적용 전 명령, 샘플 데이터를 확인할 수 있습니다.")
         return
 
-    if len(result.get("workflow_steps") or result.get("output_json", {}).get("workflow_steps", [])) > 1:
-        with st.expander("1. 요청 해석 결과", expanded=False):
-            st.json(result.get("output_json", {}).get("ir_structured_json", result.get("ir_structured_json", {})))
-        show_recommendations(result)
-        show_step_approval_controls(result)
-        return
+    with main_col:
+        if len(result.get("workflow_steps") or result.get("output_json", {}).get("workflow_steps", [])) > 1:
+            with st.expander("1. 요청 해석 결과", expanded=False):
+                st.json(result.get("output_json", {}).get("ir_structured_json", result.get("ir_structured_json", {})))
+            show_step_approval_controls(result)
+            return
 
-    show_final_result(result)
-    show_recommendations(result)
+        show_final_result(result)
 
-    validation_passed = result.get("validation_result", {}).get("status") == "passed"
-    st.subheader("최종 확인")
-    if not validation_passed:
-        st.warning("안전 검사가 통과하지 않아 적용할 수 없습니다.")
-        return
+        validation_passed = result.get("validation_result", {}).get("status") == "passed"
+        st.subheader("최종 확인")
+        if not validation_passed:
+            st.warning("안전 검사가 통과하지 않아 적용할 수 없습니다.")
+            return
 
-    col_approve, col_reject = st.columns(2)
-    with col_approve:
-        approve_clicked = st.button("이대로 승인")
-    with col_reject:
-        reject_clicked = st.button("적용하지 않음")
+        col_approve, col_reject = st.columns(2)
+        with col_approve:
+            approve_clicked = st.button("이대로 승인")
+        with col_reject:
+            reject_clicked = st.button("적용하지 않음")
 
-    if approve_clicked or reject_clicked:
-        st.session_state.pipeline_result = apply_existing_preview_result(st.session_state.pipeline_result, approve_clicked)
-        st.rerun()
+        if approve_clicked or reject_clicked:
+            st.session_state.pipeline_result = apply_existing_preview_result(st.session_state.pipeline_result, approve_clicked)
+            st.rerun()
 
 
 if __name__ == "__main__":

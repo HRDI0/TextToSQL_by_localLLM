@@ -21,8 +21,12 @@ Validation should include:
 - blocked SQL token checks
 - fingerprinting of approved statements
 - sample-impact generation before write execution
+- backup coverage before final raw updates
+- linked-step delta isolation by plan, step, target table, and source row
 
 Optional recommendation catalogs may be maintained outside the raw staging tables. These catalogs should contain only the metadata needed to suggest likely columns or values at request time. Public documentation should describe them generically and should not include real source values.
+
+Linked-step preview deltas and raw-update backups should live outside the raw staging tables. Preview deltas represent hypothetical approved preview state for dependent calculations. Backup rows represent the pre-update raw state needed before a final approved raw mutation.
 
 ```mermaid
 flowchart LR
@@ -32,6 +36,19 @@ flowchart LR
     Preview["New review run\nexecution disabled"]
 
     Staging --> Catalog --> Resolver --> Preview
+```
+
+```mermaid
+flowchart LR
+    Raw["Raw staging tables"]
+    Delta["Preview delta items"]
+    Effective["Effective preview relation"]
+    Backup["Raw update backup"]
+    Execute["Final guarded update"]
+
+    Raw --> Effective
+    Delta --> Effective
+    Raw --> Backup --> Execute
 ```
 
 ## What Not To Publish

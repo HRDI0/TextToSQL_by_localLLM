@@ -1,8 +1,10 @@
 # Public Overview
 
-This project demonstrates a guarded workflow for applying natural-language change requests to tabular data stored in a relational database.
+This project demonstrates a guarded workflow for applying natural-language review requests to tabular data stored in a relational database.
 
 The system is designed for datasets that require careful review before mutation. Instead of sending generated SQL directly to the database, the workflow builds a guided review flow: parse the request, generate a candidate statement, validate it against live metadata, show sample rows and expected changes, and execute only after explicit confirmation.
+
+Linked requests are handled as reviewable steps. A correction preview can produce approved preview deltas for a later calculation without changing the raw tables. Follow-up SELECT or aggregate previews read an effective relation made from raw rows plus approved dependency deltas. Final raw UPDATE execution is separate and requires fingerprint matching plus backup coverage before mutation.
 
 ## Goals
 
@@ -15,10 +17,10 @@ The system is designed for datasets that require careful review before mutation.
 ## High-Level Architecture
 
 ```text
-Source files -> Loader CLI -> MariaDB -> Workflow graph -> Sample impact view -> Confirmation -> Execution
+Source files -> Loader CLI -> MariaDB -> LangGraph stages -> Preview JSON -> Confirmation -> Backup-gated execution
 ```
 
-The workflow code is organized as small checkpoints so validation, sample-impact generation, and execution gates can be reviewed independently.
+The workflow code is organized as small checkpoints so parsing, SQL compilation, validation, preview generation, linked-step overlay, and execution gates can be reviewed independently.
 
 ## Public Sharing Boundary
 
