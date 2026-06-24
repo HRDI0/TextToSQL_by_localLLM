@@ -8,6 +8,7 @@
 - [02. 연계 질문 성능 개선을 위한 DB/LangGraph 설계 개선](02_linked_step_design_improvement.md)
 - [03. Gemini 기반 Semantic 정확도 개선](03_gemini_semantic_accuracy_improvement.md)
 - [04. Linked-Step Delta Overlay Preview](04_linked_step_delta_overlay.md)
+- [05. Scalable Linked-Step Overlay와 Backup Gate 개선](05_scalable_linked_step_overlay_and_backup.md)
 
 ## 공개 범위
 

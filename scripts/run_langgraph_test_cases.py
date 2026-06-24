@@ -14,6 +14,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 
+from app.langgraph_workflow import connect_db  # noqa: E402
+from app.langgraph_workflow.stage_04_output import ensure_linked_plan, update_delta_status  # noqa: E402
 from app.streamlit_langgraph_test import effective_preview_context_for_step, filtered_ir_for_step, preview_delta_items_from_result, run_graph  # noqa: E402
 
 
@@ -608,6 +610,8 @@ def summarize_multistep_result(case_number: str, result: dict[str, Any], selecti
     step_summaries: list[dict[str, Any]] = []
     accepted_step_ids: set[str] = set()
     step_preview_results: dict[str, dict[str, Any]] = {}
+    with connect_db() as connection:
+        linked_plan_id = ensure_linked_plan(connection, selection_text, modification_text, steps)
     for index, step in enumerate(steps, start=1):
         step_id = str(step.get("step_id") or step.get("group_id"))
         try:
@@ -618,12 +622,15 @@ def summarize_multistep_result(case_number: str, result: dict[str, Any], selecti
                 approved=False,
                 ir_override=filtered_ir_for_step(result, step_id),
                 active_step_id=step_id,
-                effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted_step_ids, step_preview_results),
+                effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted_step_ids, step_preview_results, linked_plan_id),
+                linked_plan_id=linked_plan_id,
             )
             step_summary = summarize_result(f"{case_number}.{index}", step_result, modification_text)
             if step_summary.get("status") == "PASS":
                 step_preview_results[step_id] = {**step_result, "preview_delta_items": preview_delta_items_from_result(step_result, "approved")}
                 accepted_step_ids.add(step_id)
+                with connect_db() as connection:
+                    update_delta_status(connection, linked_plan_id, step_id, "approved")
         except Exception as exc:
             step_summary = {
                 "status": "ERROR",

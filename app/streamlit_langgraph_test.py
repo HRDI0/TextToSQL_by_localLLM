@@ -27,7 +27,7 @@ from app.langgraph_workflow import (
     build_modification_workflow_graph,
     connect_db,
 )
-from app.langgraph_workflow.stage_04_output import build_final_output_json, can_execute, execute_confirmed_sql
+from app.langgraph_workflow.stage_04_output import build_final_output_json, can_execute, ensure_linked_plan, execute_confirmed_sql, update_delta_status
 
 
 SELECTION_PLACEHOLDER = "예: 5월 검색광고를 확인하고 싶어."
@@ -145,6 +145,7 @@ def run_graph(
     ir_override: dict[str, Any] | None = None,
     active_step_id: str | None = None,
     effective_preview_context: dict[str, Any] | None = None,
+    linked_plan_id: int | None = None,
 ) -> dict[str, Any]:
     state = build_demo_state(approved=approved, stored_rules=stored_rules)
     state.update(
@@ -159,6 +160,8 @@ def run_graph(
         state["approved_preview_fingerprint"] = approved_preview_fingerprint
     if active_step_id:
         state["active_step_id"] = active_step_id
+    if linked_plan_id:
+        state["linked_plan_id"] = linked_plan_id
     if effective_preview_context:
         state["effective_preview_context"] = effective_preview_context
     if ir_override:
@@ -171,7 +174,7 @@ def run_graph(
         return graph.invoke(state)
 
 
-def apply_existing_preview_result(result: dict[str, Any], approved: bool, execute: bool = True) -> dict[str, Any]:
+def apply_existing_preview_result(result: dict[str, Any], approved: bool, execute: bool = True, final_linked_execution: bool = False) -> dict[str, Any]:
     updated = dict(result)
     change_preview_json = updated.get("change_preview_json", {})
     user_confirmation = {
@@ -182,6 +185,15 @@ def apply_existing_preview_result(result: dict[str, Any], approved: bool, execut
         "approved_preview_fingerprint": change_preview_json.get("preview_fingerprint"),
     }
     updated["user_confirmation"] = user_confirmation
+    if final_linked_execution:
+        updated["final_linked_execution"] = True
+
+    context = updated.get("effective_preview_context", {})
+    linked_plan_id = context.get("linked_plan_id") or updated.get("linked_plan_id") if isinstance(context, dict) else updated.get("linked_plan_id")
+    active_step_id = updated.get("active_step_id")
+    if active_step_id and linked_plan_id:
+        with connect_db() as connection:
+            update_delta_status(connection, int(linked_plan_id), str(active_step_id), "approved" if approved else "cancelled")
 
     if not approved:
         updated["execution_result"] = {
@@ -219,8 +231,8 @@ def show_state_section(title: str, state: dict[str, Any], key: str) -> None:
 
 def show_final_result(result: dict[str, Any]) -> None:
     output = result.get("output_json", {})
-    st.subheader("1. 요청 해석 결과")
-    st.json(output.get("ir_structured_json", {}))
+    with st.expander("1. 요청 해석 결과", expanded=False):
+        st.json(output.get("ir_structured_json", {}))
 
     st.subheader("2. 실제 적용 전 확인용 명령")
     query_from_ir = output.get("query_from_ir", {})
@@ -275,6 +287,17 @@ def split_source_channel_value(value: Any) -> tuple[str | None, str]:
 
 def compact_text(value: Any) -> str:
     return "".join(str(value or "").split()).lower()
+
+
+def unique_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def media_segments_from_text(text: str) -> list[dict[str, str]]:
@@ -522,8 +545,8 @@ def filtered_ir_for_step(result: dict[str, Any], step_id: str) -> dict[str, Any]
         step_intent = str(selected.get("intent_type") or ir.get("intent_type") or modification.get("intent_type") or "")
         ir["intent_type"] = step_intent
         modification["intent_type"] = step_intent
-        modification["group_by"] = selected.get("group_by", modification.get("group_by", []))
-        modification["metrics"] = selected.get("metrics", modification.get("metrics", []))
+        modification["group_by"] = selected.get("group_by", [])
+        modification["metrics"] = selected.get("metrics", [])
         modification["derived_column"] = selected.get("derived_column", modification.get("derived_column", {}))
         modification["condition_groups"] = [selected]
     else:
@@ -575,20 +598,43 @@ def preview_delta_items_from_result(result: dict[str, Any], status: str = "appro
     return [{**item, "status": status} for item in items if isinstance(item, dict) and item.get("source_row_id") not in {None, ""}]
 
 
+def overlay_columns_from_result(result: dict[str, Any]) -> list[str]:
+    columns: list[str] = []
+    for action in result.get("sql_candidate", {}).get("actions", []):
+        if isinstance(action, dict) and action.get("target_field"):
+            columns.append(str(action["target_field"]))
+    for item in result.get("preview_delta_items") or result.get("change_preview_json", {}).get("preview_delta_items", []):
+        if isinstance(item, dict) and isinstance(item.get("after"), dict):
+            columns.extend(str(column) for column in item["after"].keys())
+    seen: set[str] = set()
+    return [column for column in columns if not (column in seen or seen.add(column))]
+
+
 def effective_preview_context_for_step(
     steps: list[dict[str, Any]],
     step_id: str,
     accepted: set[str],
     previews: dict[str, dict[str, Any]],
+    linked_plan_id: int | None = None,
 ) -> dict[str, Any]:
     current_order = step_order_for_id(steps, step_id)
-    delta_items: list[dict[str, Any]] = []
+    dependency_ancestors = ancestor_step_ids(steps, step_id)
+    overlay_columns: list[str] = []
+    overlay_step_keys: list[str] = []
     for step in steps:
         prior_id = str(step.get("step_id") or step.get("group_id"))
         if prior_id not in accepted or step_order_for_id(steps, prior_id) >= current_order:
             continue
-        delta_items.extend(preview_delta_items_from_result(previews.get(prior_id, {}), "approved"))
-    return {"active_step_order": current_order, "delta_items": delta_items}
+        if prior_id not in dependency_ancestors:
+            continue
+        overlay_step_keys.append(prior_id)
+        overlay_columns.extend(overlay_columns_from_result(previews.get(prior_id, {})))
+    return {
+        "linked_plan_id": linked_plan_id,
+        "active_step_order": current_order,
+        "overlay_columns": unique_preserve_order(overlay_columns),
+        "overlay_step_keys": unique_preserve_order(overlay_step_keys),
+    }
 
 
 def later_step_ids(steps: list[dict[str, Any]], step_id: str) -> set[str]:
@@ -730,6 +776,7 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
     signatures: dict[str, str] = st.session_state[signature_key]
     stale_previews: dict[str, dict[str, Any]] = st.session_state[stale_key]
     last_input = st.session_state.get("last_valid_input", {})
+    linked_plan_id = st.session_state.get("linked_plan_id") or result.get("linked_plan_id")
 
     for index, step in enumerate(steps, start=1):
         step_id = str(step.get("step_id") or step.get("group_id"))
@@ -775,7 +822,8 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                     approved=False,
                     ir_override=filtered_ir_for_step(result, step_id),
                     active_step_id=step_id,
-                    effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews),
+                    effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews, linked_plan_id),
+                    linked_plan_id=linked_plan_id,
                 )
                 signatures[step_id] = current_signature
                 st.session_state[preview_key] = previews
@@ -801,6 +849,10 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                 st.rerun()
             if cols[2].button("이 요청 취소", key=f"cancel_{step_id}", disabled=step_id in accepted):
                 invalidated = {step_id, *later_step_ids(steps, step_id)}
+                if linked_plan_id:
+                    with connect_db() as connection:
+                        for invalid_step in invalidated:
+                            update_delta_status(connection, int(linked_plan_id), invalid_step, "cancelled")
                 cancelled.update(invalidated)
                 accepted.difference_update(invalidated)
                 for invalid_step in invalidated:
@@ -838,10 +890,11 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                 modification_text=last_input.get("modification_text", ""),
                 stored_rules=last_input.get("stored_rules", []),
                 approved=False,
-                ir_override=filtered_ir_for_step(result, step_id),
-                active_step_id=step_id,
-                effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews),
-            )
+                    ir_override=filtered_ir_for_step(result, step_id),
+                    active_step_id=step_id,
+                    effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews, linked_plan_id),
+                    linked_plan_id=linked_plan_id,
+                )
             signatures[step_id] = preview_signature(step_id, steps, accepted, cancelled)
         st.session_state[preview_key] = previews
         st.session_state[signature_key] = signatures
@@ -851,6 +904,21 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
         st.caption("전체 승인은 화면에 표시된 결과만 대상으로 합니다. 먼저 확인 가능한 요청을 모두 살펴보세요.")
     else:
         st.caption("연결된 요청은 앞 요청 승인 후 후속 결과가 바뀔 수 있으므로 요청별로 순서대로 승인하세요.")
+
+    active_step_ids = [str(step.get("step_id") or step.get("group_id")) for step in steps if str(step.get("step_id") or step.get("group_id")) not in cancelled]
+    ready_for_final_apply = bool(active_step_ids) and all(step_id in accepted and step_id in previews for step_id in active_step_ids)
+    st.subheader("연결 요청 최종 확인")
+    if st.button("승인된 요청을 원본에 최종 반영", key="final_apply_linked_steps", disabled=not ready_for_final_apply):
+        final_results: dict[str, dict[str, Any]] = {}
+        for step in steps:
+            step_id = str(step.get("step_id") or step.get("group_id"))
+            if step_id not in accepted or step_id not in previews:
+                continue
+            final_results[step_id] = apply_existing_preview_result(previews[step_id], True, execute=True, final_linked_execution=True).get("execution_result", {})
+        st.session_state.linked_final_execution_results = final_results
+        st.rerun()
+    if st.session_state.get("linked_final_execution_results"):
+        st.json(st.session_state.linked_final_execution_results)
 
 
 def main() -> None:
@@ -873,6 +941,14 @@ def main() -> None:
                 stored_rules=stored_rules,
                 approved=False,
             )
+            steps = st.session_state.pipeline_result.get("workflow_steps") or []
+            if len(steps) > 1:
+                with connect_db() as connection:
+                    linked_plan_id = ensure_linked_plan(connection, selection_text, modification_text, steps)
+                st.session_state.pipeline_result["linked_plan_id"] = linked_plan_id
+                st.session_state.linked_plan_id = linked_plan_id
+            else:
+                st.session_state.linked_plan_id = None
             st.session_state.last_valid_input = {
                 "selection_text": selection_text,
                 "modification_text": modification_text,
@@ -893,8 +969,8 @@ def main() -> None:
         return
 
     if len(result.get("workflow_steps") or result.get("output_json", {}).get("workflow_steps", [])) > 1:
-        st.subheader("1. 요청 해석 결과")
-        st.json(result.get("output_json", {}).get("ir_structured_json", result.get("ir_structured_json", {})))
+        with st.expander("1. 요청 해석 결과", expanded=False):
+            st.json(result.get("output_json", {}).get("ir_structured_json", result.get("ir_structured_json", {})))
         show_recommendations(result)
         show_step_approval_controls(result)
         return

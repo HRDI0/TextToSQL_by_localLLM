@@ -86,6 +86,7 @@ class ModificationWorkflowState(TypedDict, total=False):
     output_json: dict[str, Any]
     approved_sql_fingerprint: str
     approved_preview_fingerprint: str
+    final_linked_execution: bool
     errors: list[str]
 
 

@@ -110,12 +110,12 @@ business column alias mappings, business metric definitions만 사용한다. 코
         "conditions": [{{"field": string, "operator": "eq/in/contains/is_null_or_empty/gt/gte/lt/lte/between/or", "values": list, "conditions": list}}],
         "actions": [{{"target_field": string, "operation": "set_literal", "value": string}}],
         "group_by": [{{"field_alias": string, "resolved_column": string}}],
-        "metrics": [{{"alias": string, "expression_type": "sum/avg/conversion_rate/cost_per_conversion/ctr", "source_column": string}}],
+        "metrics": [{{"alias": string, "expression_type": "sum/avg/count/conversion_rate/cost_per_conversion/ctr", "source_column": string}}],
         "derived_column": object
       }}
     ],
     "group_by": [{{"field_alias": string, "resolved_column": string}}],
-    "metrics": [{{"alias": string, "expression_type": "sum/avg/conversion_rate/cost_per_conversion/ctr", "source_column": string}}],
+    "metrics": [{{"alias": string, "expression_type": "sum/avg/count/conversion_rate/cost_per_conversion/ctr", "source_column": string}}],
     "derived_column": object
   }}
 }}
@@ -338,7 +338,7 @@ def coerce_numeric_presence_conditions(ir: dict[str, Any], source_text: str) -> 
 
 def classify_intent(selection_text: str, modification_text: str) -> str:
     text = f"{selection_text} {modification_text}".lower()
-    if any(keyword in text for keyword in ["합계", "평균", "전환율", "전환당", "클릭률", "비교", "계산", "ctr", "cpc", "cpa"]):
+    if any(keyword in text for keyword in ["합계", "평균", "건수", "몇 건", "몇건", "row 수", "행 수", "전환율", "전환당", "클릭률", "비교", "계산", "count", "ctr", "cpc", "cpa"]):
         return AGGREGATE_INTENT
     if any(keyword in text for keyword in ["새 컬럼", "새 구분", "새 항목", "만들", "기입", "분류값", "구분값", "상태값", "상태 값", "임시 상태", "붙", "값으로 분류"]):
         return ADD_DERIVED_COLUMN_INTENT

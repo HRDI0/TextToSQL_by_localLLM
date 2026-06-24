@@ -5,11 +5,176 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, Mapping
 
 from app.langgraph_workflow.db import quote_identifier
 from app.langgraph_workflow.state import ModificationWorkflowState
+
+
+LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
+PREVIEW_AUDIT_LOG = LOG_DIR / "workflow_preview_audit.jsonl"
+
+
+def append_preview_audit_log(state: Mapping[str, Any], output_json: dict[str, Any]) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "active_step_id": state.get("active_step_id"),
+        "selection_text": state.get("selection_text", ""),
+        "modification_text": state.get("modification_text", ""),
+        "request_interpretation": output_json.get("ir_structured_json", {}),
+        "query": output_json.get("query_from_ir", {}),
+        "sample_result": output_json.get("row_modification_examples", {}),
+        "linked_step_results": output_json.get("linked_step_results", []),
+    }
+    with PREVIEW_AUDIT_LOG.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+
+def query_for_positional_params(sql: str, params: list[Any] | tuple[Any, ...]) -> str:
+    if not params:
+        return sql
+    return re.sub(r"%(?!s)", "%%", sql)
+
+
+def request_fingerprint(selection_text: str, modification_text: str, steps: list[dict[str, Any]] | None = None) -> str:
+    payload = json.dumps(
+        {"selection_text": selection_text, "modification_text": modification_text, "steps": steps or []},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def ensure_linked_plan(connection: Any, selection_text: str, modification_text: str, steps: list[dict[str, Any]]) -> int:
+    fingerprint = request_fingerprint(selection_text, modification_text, steps)
+    dependent_count = sum(1 for step in steps if step.get("depends_on"))
+    expires_at = datetime.now() + timedelta(hours=24)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO rule_engine_linked_plan (
+                request_fingerprint, step_count, dependent_step_count, validation_status,
+                validation_errors, plan_status, expires_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (fingerprint, len(steps), dependent_count, "planned", None, "previewing", expires_at),
+        )
+        linked_plan_id = int(cursor.lastrowid or 0)
+        for index, step in enumerate(steps, start=1):
+            step_key = str(step.get("step_id") or step.get("group_id") or f"step_{index}")
+            cursor.execute(
+                """
+                INSERT INTO rule_engine_linked_plan_step (
+                    linked_plan_id, step_order, step_key, intent_type, dependency_type,
+                    depends_on_json, target_table, step_status, plan_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    linked_plan_id,
+                    index,
+                    step_key,
+                    step.get("intent_type"),
+                    "dependent" if step.get("depends_on") else "independent",
+                    json.dumps(step.get("depends_on", []), ensure_ascii=False),
+                    step.get("target_table"),
+                    "planned",
+                    json.dumps(step, ensure_ascii=False, default=str),
+                ),
+            )
+    connection.commit()
+    return linked_plan_id
+
+
+def linked_step_id_for_key(connection: Any, linked_plan_id: int, step_key: str) -> int | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT linked_step_id FROM rule_engine_linked_plan_step
+            WHERE linked_plan_id = %s AND step_key = %s
+            """,
+            (linked_plan_id, step_key),
+        )
+        row = cursor.fetchone()
+    return int(row["linked_step_id"]) if row else None
+
+
+def persist_preview_delta_items(
+    connection: Any,
+    linked_plan_id: int | None,
+    step_key: str | None,
+    step_order: int | None,
+    target_table: str | None,
+    preview_fingerprint_value: str | None,
+    delta_items: list[dict[str, Any]],
+) -> None:
+    if not connection or not linked_plan_id or not step_key or not step_order or not target_table or not delta_items:
+        return
+    linked_step_id = linked_step_id_for_key(connection, linked_plan_id, step_key)
+    expires_at = datetime.now() + timedelta(hours=24)
+    rows = [
+        (
+            linked_plan_id,
+            linked_step_id,
+            step_key,
+            step_order,
+            target_table,
+            item.get("source_row_id"),
+            item.get("source_row_hash"),
+            item.get("delta_type", "preview_update"),
+            json.dumps(item.get("before", {}), ensure_ascii=False, default=str),
+            json.dumps(item.get("after", {}), ensure_ascii=False, default=str),
+            json.dumps(item.get("delta", {}), ensure_ascii=False, default=str),
+            preview_fingerprint_value,
+            "pending",
+            expires_at,
+        )
+        for item in delta_items
+    ]
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM rule_engine_delta_item WHERE linked_plan_id = %s AND step_key = %s AND delta_status = 'pending'",
+            (linked_plan_id, step_key),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO rule_engine_delta_item (
+                linked_plan_id, linked_step_id, step_key, step_order, target_table,
+                source_row_id, source_row_hash, delta_type, before_json, after_json,
+                delta_json, preview_fingerprint, delta_status, expires_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            rows,
+        )
+        cursor.execute(
+            """
+            UPDATE rule_engine_linked_plan_step
+            SET step_status = 'previewed', validation_status = 'passed', preview_fingerprint = %s
+            WHERE linked_plan_id = %s AND step_key = %s
+            """,
+            (preview_fingerprint_value, linked_plan_id, step_key),
+        )
+    connection.commit()
+
+
+def update_delta_status(connection: Any, linked_plan_id: int | None, step_key: str | None, status: str) -> None:
+    if not connection or not linked_plan_id or not step_key:
+        return
+    approval_status = "approved" if status == "approved" else "rejected"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE rule_engine_delta_item SET delta_status = %s WHERE linked_plan_id = %s AND step_key = %s AND delta_status IN ('pending', 'approved')",
+            (status, linked_plan_id, step_key),
+        )
+        cursor.execute(
+            "UPDATE rule_engine_linked_plan_step SET approval_status = %s WHERE linked_plan_id = %s AND step_key = %s",
+            (approval_status, linked_plan_id, step_key),
+        )
+    connection.commit()
 
 
 def row_matches_predicate(row: dict[str, Any], predicate: list[dict[str, Any]]) -> bool:
@@ -66,11 +231,15 @@ def build_preview_from_candidate(
     if sql_candidate.get("sql_type") == "SELECT":
         if connection is None:
             raise ValueError("SELECT preview rows must be derived from the database with the validated SQL.")
+        count_sql = f"SELECT COUNT(*) AS affected_row_count FROM ({sql_candidate['sql']}) AS preview_query_count"
         preview_sql = f"SELECT * FROM ({sql_candidate['sql']}) AS preview_query LIMIT %s"
+        params = list(sql_candidate.get("params", []))
         with connection.cursor() as cursor:
-            cursor.execute(preview_sql, tuple([*sql_candidate.get("params", []), limit]))
+            cursor.execute(query_for_positional_params(count_sql, params), tuple(params))
+            affected_row_count = int(cursor.fetchone()["affected_row_count"])
+            cursor.execute(query_for_positional_params(preview_sql, [*params, limit]), tuple([*params, limit]))
             rows = list(cursor.fetchall())
-        return [{"row_index": index, "db_row": row} for index, row in enumerate(rows)], len(rows), []
+        return [{"row_index": index, "db_row": row} for index, row in enumerate(rows)], affected_row_count, []
     if sql_candidate.get("sql_type") == "INSERT" and sql_candidate.get("source") == "derived_value_insert_renderer":
         if connection is None:
             raise ValueError("Derived-value preview rows must be derived from the database with the validated SQL predicate.")
@@ -80,9 +249,9 @@ def build_preview_from_candidate(
         count_sql = f"SELECT COUNT(*) AS affected_row_count FROM {quote_identifier(target_table)} WHERE {where_sql}"
         select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql} LIMIT %s"
         with connection.cursor() as cursor:
-            cursor.execute(count_sql, tuple(where_params))
+            cursor.execute(query_for_positional_params(count_sql, where_params), tuple(where_params))
             affected_row_count = int(cursor.fetchone()["affected_row_count"])
-            cursor.execute(select_sql, tuple([*where_params, limit]))
+            cursor.execute(query_for_positional_params(select_sql, [*where_params, limit]), tuple([*where_params, limit]))
             target_rows = list(cursor.fetchall())
         preview_rows = [
             {
@@ -109,9 +278,9 @@ def build_preview_from_candidate(
     select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}"
 
     with connection.cursor() as cursor:
-        cursor.execute(count_sql, tuple(where_params))
+        cursor.execute(query_for_positional_params(count_sql, where_params), tuple(where_params))
         affected_row_count = int(cursor.fetchone()["affected_row_count"])
-        cursor.execute(select_sql, tuple(where_params))
+        cursor.execute(query_for_positional_params(select_sql, where_params), tuple(where_params))
         target_rows = list(cursor.fetchall())
 
     preview_rows: list[dict[str, Any]] = []
@@ -143,7 +312,7 @@ def render_sql_preview(connection: Any, sql_candidate: dict[str, Any]) -> str:
     if not sql or connection is None:
         return sql
     with connection.cursor() as cursor:
-        rendered = cursor.mogrify(sql, params)
+        rendered = cursor.mogrify(query_for_positional_params(sql, params), params)
     return rendered.decode("utf-8") if isinstance(rendered, bytes) else str(rendered)
 
 
@@ -177,12 +346,61 @@ def rollback_snapshot(connection: Any, sql_candidate: dict[str, Any]) -> dict[st
     select_columns = ["row_id", *target_fields]
     select_sql = f"SELECT {', '.join(quote_identifier(column) for column in select_columns)} FROM {quote_identifier(target_table)} WHERE {where_sql}"
     with connection.cursor() as cursor:
-        cursor.execute(select_sql, tuple(update_where_params(sql_candidate)))
+        params = update_where_params(sql_candidate)
+        cursor.execute(query_for_positional_params(select_sql, params), tuple(params))
         rows = list(cursor.fetchall())
     rollback_set_sql = ", ".join(f"{quote_identifier(column)} = %s" for column in target_fields)
     rollback_sql = f"UPDATE {quote_identifier(target_table)} SET {rollback_set_sql} WHERE `row_id` = %s"
     rollback_params = [[row.get(column) for column in target_fields] + [row.get("row_id")] for row in rows]
     return {"rows": rows, "rollback_sql": rollback_sql, "rollback_params": rollback_params}
+
+
+def backup_raw_update_rows(connection: Any, sql_candidate: dict[str, Any], backup_scope: str | None) -> dict[str, Any]:
+    if sql_candidate.get("sql_type") != "UPDATE" or not backup_scope:
+        return {"backup_scope": backup_scope, "backup_row_count": 0}
+    if not table_exists(connection, "rule_engine_raw_update_backup"):
+        raise RuntimeError("raw_update_backup_table_missing")
+    target_table = sql_candidate["target_table"]
+    where_sql = extract_update_where_sql(sql_candidate["sql"])
+    select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}"
+    params = update_where_params(sql_candidate)
+    with connection.cursor() as cursor:
+        cursor.execute(query_for_positional_params(select_sql, params), tuple(params))
+        rows = list(cursor.fetchall())
+        row_ids = [row.get("row_id") for row in rows if row.get("row_id") is not None]
+        if len(row_ids) != len(rows):
+            raise RuntimeError("raw_update_backup_requires_row_id")
+        if row_ids:
+            cursor.executemany(
+                """
+                INSERT IGNORE INTO rule_engine_raw_update_backup (
+                    backup_scope, target_table, source_row_id, source_row_hash, before_json
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        backup_scope,
+                        target_table,
+                        row.get("row_id"),
+                        row.get("source_row_hash"),
+                        json.dumps(row, ensure_ascii=False, default=str),
+                    )
+                    for row in rows
+                ],
+            )
+            placeholders = ", ".join(["%s"] * len(row_ids))
+            cursor.execute(
+                f"""
+                SELECT COUNT(*) AS backup_row_count
+                FROM rule_engine_raw_update_backup
+                WHERE backup_scope = %s AND target_table = %s AND source_row_id IN ({placeholders})
+                """,
+                tuple([backup_scope, target_table, *row_ids]),
+            )
+            backed_up_count = int(cursor.fetchone()["backup_row_count"])
+            if backed_up_count != len(set(row_ids)):
+                raise RuntimeError("raw_update_backup_incomplete")
+    return {"backup_scope": backup_scope, "backup_row_count": len(rows)}
 
 
 def insert_execution_log(
@@ -293,6 +511,27 @@ def build_change_preview_json_node(state: ModificationWorkflowState, connection:
         preview_delta_items = []
         affected_row_count = 0
         preview_error = str(exc)
+    sample_delta_items = [row["delta_item"] for row in preview_rows if isinstance(row.get("delta_item"), dict)]
+    change_preview_json = build_change_preview_json(
+        state["sql_candidate"],
+        validation_result,
+        preview_rows,
+        affected_row_count,
+        rendered_sql,
+        preview_error,
+        sample_delta_items,
+    )
+    context = state.get("effective_preview_context", {})
+    if preview_error is None and isinstance(context, dict):
+        persist_preview_delta_items(
+            connection,
+            context.get("linked_plan_id") or state.get("linked_plan_id"),
+            state.get("active_step_id"),
+            context.get("active_step_order"),
+            state["sql_candidate"].get("target_table"),
+            change_preview_json.get("preview_fingerprint"),
+            preview_delta_items,
+        )
     linked_step_result = {
         "step_id": state.get("active_step_id"),
         "sql_fingerprint": state["sql_candidate"].get("sql_fingerprint"),
@@ -300,24 +539,16 @@ def build_change_preview_json_node(state: ModificationWorkflowState, connection:
         "target_table": state["sql_candidate"].get("target_table"),
         "affected_row_count": affected_row_count,
         "previewed_row_count": len(preview_rows),
-        "preview_delta_items": preview_delta_items,
+        "preview_delta_items": sample_delta_items,
     }
     linked_step_results = [*state.get("linked_step_results", [])]
     if state.get("active_step_id"):
         linked_step_results.append(linked_step_result)
     return {
         "preview_rows": preview_rows,
-        "preview_delta_items": preview_delta_items,
+        "preview_delta_items": sample_delta_items,
         "linked_step_results": linked_step_results,
-        "change_preview_json": build_change_preview_json(
-            state["sql_candidate"],
-            validation_result,
-            preview_rows,
-            affected_row_count,
-            rendered_sql,
-            preview_error,
-            preview_delta_items,
-        ),
+        "change_preview_json": change_preview_json,
     }
 
 
@@ -355,7 +586,7 @@ def wait_for_user_confirmation_node(state: ModificationWorkflowState) -> dict[st
 
 def execute_confirmed_sql(connection: Any, state: ModificationWorkflowState) -> dict[str, Any]:
     sql_candidate = state["sql_candidate"]
-    if state.get("active_step_id"):
+    if state.get("active_step_id") and not state.get("final_linked_execution"):
         return {
             "status": "skipped",
             "reason": "linked_step_preview_approval_only",
@@ -372,11 +603,14 @@ def execute_confirmed_sql(connection: Any, state: ModificationWorkflowState) -> 
             "affected_row_count": 0,
         }
     rollback: dict[str, Any] = {"rows": [], "rollback_sql": None, "rollback_params": []}
+    backup: dict[str, Any] = {"backup_scope": None, "backup_row_count": 0}
     try:
         if sql_candidate["sql_type"] == "UPDATE":
             rollback = rollback_snapshot(connection, sql_candidate)
+            backup = backup_raw_update_rows(connection, sql_candidate, state.get("change_preview_json", {}).get("preview_fingerprint"))
         with connection.cursor() as cursor:
-            cursor.execute(sql_candidate["sql"], tuple(sql_candidate.get("params", [])))
+            params = list(sql_candidate.get("params", []))
+            cursor.execute(query_for_positional_params(sql_candidate["sql"], params), tuple(params))
             if sql_candidate["sql_type"] != "SELECT":
                 affected_row_count = cursor.rowcount
             else:
@@ -400,6 +634,8 @@ def execute_confirmed_sql(connection: Any, state: ModificationWorkflowState) -> 
             "affected_row_count": affected_row_count,
             "execution_log_id": execution_id,
             "rollback_row_count": len(rollback.get("rows", [])),
+            "backup_scope": backup.get("backup_scope"),
+            "backup_row_count": backup.get("backup_row_count", 0),
         }
     except Exception as exc:
         connection.rollback()
@@ -409,7 +645,7 @@ def execute_confirmed_sql(connection: Any, state: ModificationWorkflowState) -> 
 
 
 def execute_confirmed_sql_node(state: ModificationWorkflowState, connection: Any = None) -> dict[str, Any]:
-    if state.get("active_step_id"):
+    if state.get("active_step_id") and not state.get("final_linked_execution"):
         return {
             "execution_result": {
                 "status": "skipped",
@@ -459,6 +695,8 @@ def build_execution_result_json(execution_result: dict[str, Any], effective_modi
         "affected_row_count": execution_result.get("affected_row_count", 0),
         "execution_log_id": execution_result.get("execution_log_id"),
         "rollback_row_count": execution_result.get("rollback_row_count", 0),
+        "backup_scope": execution_result.get("backup_scope"),
+        "backup_row_count": execution_result.get("backup_row_count", 0),
         "rule_source": effective_modification_plan.get("source"),
         "result_message": result_message,
     }
@@ -583,4 +821,6 @@ def build_final_output_json(state: ModificationWorkflowState) -> dict[str, Any]:
 
 def build_execution_result_json_node(state: ModificationWorkflowState) -> dict[str, Any]:
     ir_structured_json = build_ir_structured_json(state)
-    return {"ir_structured_json": ir_structured_json, "output_json": build_final_output_json({**state, "ir_structured_json": ir_structured_json})}
+    output_json = build_final_output_json({**state, "ir_structured_json": ir_structured_json})
+    append_preview_audit_log(state, output_json)
+    return {"ir_structured_json": ir_structured_json, "output_json": output_json}

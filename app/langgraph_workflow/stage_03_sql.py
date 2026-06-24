@@ -74,41 +74,84 @@ def overlay_delta_items_for_table(state: ModificationWorkflowState, target_table
     return [item for item in items if isinstance(item, dict) and item.get("target_table") == target_table and item.get("source_row_id") not in {None, ""}]
 
 
+def json_path_for_column(column: str) -> str:
+    return '$."' + column.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
 def effective_table_source_sql(
     target_table: str,
     columns: list[str],
-    delta_items: list[dict[str, Any]],
+    overlay_context: dict[str, Any] | list[dict[str, Any]],
+    raw_where_sql: str = "",
+    raw_where_params: list[Any] | None = None,
 ) -> tuple[str, list[Any], list[str]]:
-    if not delta_items:
+    if isinstance(overlay_context, list):
+        delta_items = overlay_context
+        if not delta_items:
+            return quote_identifier(target_table), [], []
+        overlay_columns = unique_preserve_order(
+            [
+                str(column)
+                for item in delta_items
+                if isinstance(item, dict) and item.get("target_table") == target_table and isinstance(item.get("after"), dict)
+                for column in item["after"].keys()
+                if str(column) in columns
+            ]
+        )
+        # Legacy in-memory deltas are intentionally not expanded into row-level CASE SQL.
+        if not overlay_columns:
+            return quote_identifier(target_table), [], []
         return quote_identifier(target_table), [], []
 
-    values_by_column: dict[str, dict[Any, Any]] = {}
-    for item in delta_items:
-        after = item.get("after", {})
-        if not isinstance(after, dict):
-            continue
-        row_id = item.get("source_row_id")
-        for column, value in after.items():
-            if column not in columns:
-                continue
-            values_by_column.setdefault(str(column), {})[row_id] = value
-    if not values_by_column:
+    linked_plan_id = overlay_context.get("linked_plan_id")
+    active_step_order = overlay_context.get("active_step_order")
+    overlay_columns = [str(column) for column in overlay_context.get("overlay_columns", []) if str(column) in columns]
+    overlay_step_keys = [str(step_key) for step_key in overlay_context.get("overlay_step_keys", []) if str(step_key)]
+    if not linked_plan_id or not active_step_order or not overlay_columns or not overlay_step_keys:
         return quote_identifier(target_table), [], []
 
     select_parts: list[str] = []
-    params: list[Any] = []
+    select_params: list[Any] = []
+    join_params: list[Any] = []
+    joins: list[str] = []
+    overlay_set = set(overlay_columns)
     for column in columns:
-        row_values = values_by_column.get(column)
-        if not row_values:
-            select_parts.append(quote_identifier(column))
+        raw_column = f"raw.{quote_identifier(column)}"
+        if column not in overlay_set or column == "row_id":
+            select_parts.append(f"{raw_column} AS {quote_identifier(column)}")
             continue
-        cases: list[str] = []
-        for row_id, value in row_values.items():
-            cases.append("WHEN %s THEN %s")
-            params.extend([row_id, value])
-        select_parts.append(f"CASE {quote_identifier('row_id')} {' '.join(cases)} ELSE {quote_identifier(column)} END AS {quote_identifier(column)}")
-    source_sql = f"(SELECT {', '.join(select_parts)} FROM {quote_identifier(target_table)}) AS effective_source"
-    return source_sql, params, unique_preserve_order(list(values_by_column.keys()))
+        alias = f"delta_{len(joins)}"
+        path = json_path_for_column(column)
+        step_key_placeholders = ", ".join(["%s"] * len(overlay_step_keys))
+        joins.append(
+            f"LEFT JOIN rule_engine_delta_item {alias} ON {alias}.delta_item_id = ("
+            "SELECT di.delta_item_id FROM rule_engine_delta_item di "
+            "WHERE di.linked_plan_id = %s AND di.target_table = %s "
+            f"AND di.step_key IN ({step_key_placeholders}) "
+            "AND di.source_row_id = raw.row_id AND di.delta_status = 'approved' "
+            "AND (di.expires_at IS NULL OR di.expires_at > NOW()) AND di.step_order < %s "
+            "AND JSON_CONTAINS_PATH(di.after_json, 'one', %s) "
+            "ORDER BY di.step_order DESC, di.delta_item_id DESC LIMIT 1)"
+        )
+        join_params.extend([linked_plan_id, target_table, *overlay_step_keys, active_step_order, path])
+        select_parts.append(
+            f"CASE WHEN {alias}.delta_item_id IS NOT NULL THEN JSON_UNQUOTE(JSON_EXTRACT({alias}.after_json, %s)) "
+            f"ELSE {raw_column} END AS {quote_identifier(column)}"
+        )
+        select_params.append(path)
+    where_clause = ""
+    where_params = list(raw_where_params or [])
+    if raw_where_sql and raw_where_sql != "1 = 1":
+        where_clause = f" WHERE {qualify_where_columns(raw_where_sql, columns, 'raw')}"
+    source_sql = f"(SELECT {', '.join(select_parts)} FROM {quote_identifier(target_table)} AS raw {' '.join(joins)}{where_clause}) AS effective_source"
+    return source_sql, [*select_params, *join_params, *where_params], unique_preserve_order(overlay_columns)
+
+
+def qualify_where_columns(where_sql: str, columns: list[str], table_alias: str) -> str:
+    qualified = where_sql
+    for column in sorted(columns, key=len, reverse=True):
+        qualified = qualified.replace(quote_identifier(column), f"{table_alias}.{quote_identifier(column)}")
+    return qualified
 
 
 def column_sql_for_comparison(column: str, values: list[Any]) -> str:
@@ -1007,6 +1050,9 @@ def metric_specs_from_dictionary(text: str, target_table: str, columns: list[str
 
 def metric_specs_from_obvious_words(text: str, columns: list[str]) -> list[dict[str, Any]]:
     compact = compact_text(text)
+    specs: list[dict[str, Any]] = []
+    if any(token in compact for token in ["건수", "몇건", "row수", "행수", "count"]):
+        specs.append({"alias": "건수", "expression_type": "count", "source_column": ""})
     candidates = [
         ("비용", "sum", ["비용합계", "광고비합계", "costsum", "spendsum"]),
         ("비용", "avg", ["비용평균", "광고비평균", "costavg", "spendavg"]),
@@ -1017,7 +1063,6 @@ def metric_specs_from_obvious_words(text: str, columns: list[str]) -> list[dict[
         ("세션수", "sum", ["세션합계", "세션수합계", "sessionsum"]),
         ("세션수", "avg", ["세션평균", "세션수평균", "sessionavg"]),
     ]
-    specs: list[dict[str, Any]] = []
     for column, expression_type, tokens in candidates:
         if column not in columns:
             continue
@@ -1029,18 +1074,25 @@ def metric_specs_from_obvious_words(text: str, columns: list[str]) -> list[dict[
 
 def merge_metric_specs(primary: list[dict[str, Any]], fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for metric in [*primary, *fallback]:
         source_column = str(metric.get("source_column") or metric.get("column") or "")
         if "." in source_column:
             source_column = source_column.split(".", 1)[1].strip("`")
         expression_type = str(metric.get("expression_type") or "sum").lower()
-        key = (source_column, expression_type)
+        key = (source_column, expression_type, str(metric.get("alias") or "")) if expression_type == "count" else (source_column, expression_type, "")
         if key in seen:
             continue
         seen.add(key)
         merged.append(metric)
     return merged
+
+
+def aggregate_context_text(state: ModificationWorkflowState, modification_logic: dict[str, Any]) -> str:
+    parts = [str(state.get("selection_text", "")), json.dumps(modification_logic, ensure_ascii=False)]
+    if not state.get("active_step_id"):
+        parts.insert(1, str(state.get("modification_text", "")))
+    return " ".join(parts)
 
 
 def metric_matches_definition(metric: dict[str, Any], item: dict[str, Any], text: str) -> bool:
@@ -1125,11 +1177,13 @@ def metric_expression(metric: dict[str, Any], table_columns: list[str]) -> tuple
     if " OR " in denominator_column:
         denominator_column = denominator_column.split(" OR ", 1)[0].strip().split(".")[-1].strip("`")
     alias = str(metric.get("alias") or source_column or expression_type)
+    alias_sql = quote_identifier(alias)
+    if expression_type in {"count", "row_count"}:
+        return f"COUNT(*) AS {alias_sql}", [], []
     if not source_column:
         raise ValueError(f"metric_source_column_required_for_expression_type: {expression_type}")
     if source_column not in table_columns:
         raise ValueError(f"Unknown metric source column in live schema: {source_column}")
-    alias_sql = quote_identifier(alias)
     source_sum = f"SUM({numeric_sql(source_column)})"
     if expression_type == "sum":
         return f"{source_sum} AS {alias_sql}", [source_column], []
@@ -1141,6 +1195,8 @@ def metric_expression(metric: dict[str, Any], table_columns: list[str]) -> tuple
             raise ValueError("event_count_metric_requires_event_filter")
         return f"SUM(CASE WHEN {filter_sql} THEN {numeric_sql(source_column)} ELSE 0 END) AS {alias_sql}", [source_column, *filter_columns], filter_params
     if expression_type in {"conversion_rate", "ctr", "cost_per_conversion"}:
+        if expression_type == "ctr" and not denominator_column and "노출수" in table_columns:
+            denominator_column = "노출수"
         if not denominator_column:
             raise ValueError(f"metric_denominator_column_required_for_expression_type: {expression_type}")
         if denominator_column not in table_columns:
@@ -1175,13 +1231,7 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
     modification_where = read_only_conditions_to_where(state, table_columns)
     precompiled_where = combine_where_predicates(selection_where, modification_where)
     modification_logic = state.get("modification_logic", {})
-    text = " ".join(
-        [
-            str(state.get("selection_text", "")),
-            str(state.get("modification_text", "")),
-            json.dumps(modification_logic, ensure_ascii=False),
-        ]
-    )
+    text = aggregate_context_text(state, modification_logic)
     column_alias_mappings = state.get("column_alias_mappings", [])
     group_by_columns = [
         resolve_workflow_column(str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or ""), target_table, table_columns, column_alias_mappings)
@@ -1193,12 +1243,13 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
     metric_definitions = state.get("metric_definitions", [])
     dictionary_metrics = metric_specs_from_dictionary(text, target_table, columns, metric_definitions)
     parsed_metrics = [item for item in modification_logic.get("metrics", []) if isinstance(item, dict)]
-    metrics = dictionary_metrics or parsed_metrics
+    metrics = parsed_metrics or dictionary_metrics
     if not metrics:
         metrics = metric_specs_from_obvious_words(text, columns)
     if metrics and not dictionary_metrics:
         metrics = [hydrate_metric_from_dictionary(metric, text, target_table, columns, metric_definitions) for metric in metrics]
-    metrics = merge_metric_specs(metrics, metric_specs_from_obvious_words(text, columns))
+    if not parsed_metrics:
+        metrics = merge_metric_specs(metrics, metric_specs_from_obvious_words(text, columns))
     if not metrics:
         raise ValueError("select_aggregate_requires_metrics")
 
@@ -1214,13 +1265,32 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         metric_params.extend(expression_params)
 
     where_sql = precompiled_where.get("sql", "1 = 1")
-    delta_items = overlay_delta_items_for_table(state, target_table)
-    source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, delta_items)
+    context = state.get("effective_preview_context", {})
+    overlay_context = context if isinstance(context, dict) else {}
+    should_push_where_to_raw_source = bool(overlay_context.get("overlay_columns")) and where_sql != "1 = 1"
+    source_columns = unique_preserve_order(
+        [
+            *referenced_columns,
+            *[str(column) for column in overlay_context.get("overlay_columns", []) if str(column) in columns],
+        ]
+    )
+    if not source_columns:
+        source_columns = ["row_id"] if "row_id" in columns else columns
+    source_sql, overlay_params, overlay_columns = effective_table_source_sql(
+        target_table,
+        source_columns,
+        overlay_context,
+        where_sql if should_push_where_to_raw_source else "",
+        list(precompiled_where.get("params", [])) if should_push_where_to_raw_source else [],
+    )
     group_sql = ""
     if group_by_columns:
         group_sql = " GROUP BY " + ", ".join(quote_identifier(column) for column in group_by_columns)
-    sql = f"SELECT {', '.join(select_parts)} FROM {source_sql} WHERE {where_sql}{group_sql}"
-    params = [*metric_params, *overlay_params, *precompiled_where.get("params", [])]
+    outer_where_sql = "1 = 1" if should_push_where_to_raw_source else where_sql
+    sql = f"SELECT {', '.join(select_parts)} FROM {source_sql} WHERE {outer_where_sql}{group_sql}"
+    params = [*metric_params, *overlay_params]
+    if not should_push_where_to_raw_source:
+        params.extend(precompiled_where.get("params", []))
     return {
         "source": "deterministic_select_aggregate_renderer",
         "sql_type": "SELECT",
@@ -1231,7 +1301,7 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         "reason": "intent_type=SELECT_AGGREGATE; deterministic code rendered aggregate SELECT from IR, live schema, and linked-step overlay deltas.",
         "actions": [],
         "predicate": precompiled_where.get("predicate", []),
-        "overlay_delta_count": len(delta_items),
+        "overlay_delta_count": len(overlay_columns),
         "sql_fingerprint": fingerprint_sql(sql, params),
     }
 
@@ -1246,8 +1316,8 @@ def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_co
     modification_where = read_only_conditions_to_where(state, table_columns)
     precompiled_where = combine_where_predicates(selection_where, modification_where)
     where_sql = precompiled_where.get("sql", "1 = 1")
-    delta_items = overlay_delta_items_for_table(state, target_table)
-    source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, delta_items)
+    context = state.get("effective_preview_context", {})
+    source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, context if isinstance(context, dict) else {})
     params = [*overlay_params, *precompiled_where.get("params", [])]
     sql = f"SELECT * FROM {source_sql} WHERE {where_sql}"
     return {
@@ -1260,7 +1330,7 @@ def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_co
         "reason": "intent_type=SELECT_DETAIL; rendered row-level SELECT inside the first requested scope with linked-step overlay deltas.",
         "actions": [],
         "predicate": precompiled_where.get("predicate", []),
-        "overlay_delta_count": len(delta_items),
+        "overlay_delta_count": len(overlay_columns),
         "sql_fingerprint": fingerprint_sql(sql, params),
     }
 
@@ -1597,6 +1667,7 @@ def split_top_level(sql: str, separator: str) -> list[str]:
 
 def parse_where_clause(where_sql: str) -> list[dict[str, Any]]:
     conditions: list[dict[str, Any]] = []
+    value_token = r"(?:%s|'[^']*'|\"[^\"]*\"|-?\d+(?:\.\d+)?)"
     for raw_clause in split_top_level(where_sql.strip(), "AND"):
         clause = raw_clause.strip()
         null_or_empty_match = re.fullmatch(r"\(`([^`]+)`\s+IS\s+NULL\s+OR\s+TRIM\(`([^`]+)`\)\s*=\s*''\)", clause, flags=re.IGNORECASE)
@@ -1613,11 +1684,11 @@ def parse_where_clause(where_sql: str) -> list[dict[str, Any]]:
                 nested_conditions.extend(parse_where_clause(nested_clause))
             conditions.extend(nested_conditions)
             continue
-        equals_match = re.fullmatch(r"(?:`([^`]+)`|CAST\(NULLIF\(`([^`]+)`,\s*''\)\s+AS\s+DECIMAL\(18,2\)\))\s*=\s*%s", clause, flags=re.IGNORECASE)
+        equals_match = re.fullmatch(rf"(?:`([^`]+)`|CAST\(NULLIF\(`([^`]+)`,\s*''\)\s+AS\s+DECIMAL\(18,2\)\))\s*=\s*({value_token})", clause, flags=re.IGNORECASE)
         if equals_match:
-            conditions.append({"column": equals_match.group(1) or equals_match.group(2), "operator": "eq", "placeholder_count": 1})
+            conditions.append({"column": equals_match.group(1) or equals_match.group(2), "operator": "eq", "placeholder_count": 1 if equals_match.group(3) == "%s" else 0})
             continue
-        comparison_match = re.fullmatch(r"(?:`([^`]+)`|CAST\(NULLIF\(`([^`]+)`,\s*''\)\s+AS\s+DECIMAL\(18,2\)\))\s*(>=|<=|>|<)\s*%s", clause, flags=re.IGNORECASE)
+        comparison_match = re.fullmatch(rf"(?:`([^`]+)`|CAST\(NULLIF\(`([^`]+)`,\s*''\)\s+AS\s+DECIMAL\(18,2\)\))\s*(>=|<=|>|<)\s*({value_token})", clause, flags=re.IGNORECASE)
         if comparison_match:
             column = comparison_match.group(1) or comparison_match.group(2)
             symbol = comparison_match.group(3)
@@ -1626,11 +1697,11 @@ def parse_where_clause(where_sql: str) -> list[dict[str, Any]]:
                 {
                     "column": column,
                     "operator": operator,
-                    "placeholder_count": 1,
+                    "placeholder_count": 1 if comparison_match.group(4) == "%s" else 0,
                 }
             )
             continue
-        in_match = re.fullmatch(r"`([^`]+)`\s+IN\s*\((%s(?:\s*,\s*%s)*)\)", clause, flags=re.IGNORECASE)
+        in_match = re.fullmatch(rf"`([^`]+)`\s+IN\s*\(({value_token}(?:\s*,\s*{value_token})*)\)", clause, flags=re.IGNORECASE)
         if in_match:
             conditions.append({"column": in_match.group(1), "operator": "in", "placeholder_count": in_match.group(2).count("%s")})
             continue
@@ -1675,7 +1746,7 @@ def parse_sql_with_script(sql: str) -> dict[str, Any]:
     )
     select_match = re.fullmatch(r"SELECT\s+.+\s+FROM\s+`([^`]+)`\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+)?", stripped, flags=re.IGNORECASE)
     overlay_select_match = re.fullmatch(
-        r"SELECT\s+.+\s+FROM\s+\(SELECT\s+.+\s+FROM\s+`([^`]+)`\)\s+AS\s+effective_source\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+)?",
+        r"SELECT\s+.+\s+FROM\s+\(SELECT\s+.+\s+FROM\s+`([^`]+)`(?:\s+AS\s+raw)?(?:\s+LEFT\s+JOIN\s+.+?)?(?:\s+WHERE\s+.+?)?\)\s+AS\s+effective_source\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+)?",
         stripped,
         flags=re.IGNORECASE,
     )
@@ -1842,6 +1913,18 @@ def validate_sql_with_script(
 
 def validate_generated_sql_node(state: ModificationWorkflowState, llm: Any = None) -> dict[str, Any]:
     script_review = validate_sql_with_script(state["sql_candidate"], state.get("table_columns", {}), state.get("protected_column_policies", []))
+    context = state.get("effective_preview_context", {})
+    overlay_columns = set(context.get("overlay_columns", [])) if isinstance(context, dict) else set()
+    parsed_sql = script_review.get("parsed_sql", {})
+    if parsed_sql.get("sql_type") == "UPDATE" and overlay_columns:
+        predicate_columns = {str(item.get("column")) for item in state["sql_candidate"].get("predicate", []) if item.get("column")}
+        unsafe_overlay_predicates = sorted(predicate_columns & {str(column) for column in overlay_columns})
+        if unsafe_overlay_predicates:
+            script_review = {
+                **script_review,
+                "passed": False,
+                "errors": [*script_review.get("errors", []), f"dependent_update_overlay_predicate_not_supported: {unsafe_overlay_predicates}"],
+            }
     validation_passed = script_review["passed"]
     return {
         "parsed_sql": script_review.get("parsed_sql", {}),

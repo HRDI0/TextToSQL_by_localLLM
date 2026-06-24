@@ -117,6 +117,10 @@ nohup bash scripts/run_streamlit.sh >/dev/null 2>&1 &
 
 The Streamlit script defaults to `127.0.0.1:8501` and writes logs to `logs/streamlit.log`. Expose it on a network only behind your own authentication/VPN controls.
 
+Each workflow preview also appends a JSONL audit entry to `logs/workflow_preview_audit.jsonl`. The entry includes the original request text, parsed request interpretation, rendered query metadata, sample result payload, and linked-step result metadata so failed previews can be reviewed later without changing raw tables.
+
+For linked requests, approved preview changes are stored in `rule_engine_delta_item` and later read through a compact join-based overlay. Follow-up SELECT or aggregate previews query raw rows plus approved dependency-ancestor delta rows by `linked_plan_id`, dependency step key, step order, row id, and changed column; they do not generate row-by-row `CASE row_id WHEN ...` SQL for large result sets. Dependent UPDATE predicates that would need prior delta overlay are blocked until an overlay-aware write path is available.
+
 Stop local services when needed:
 
 ```bash
@@ -135,6 +139,8 @@ Generated SQL must pass through the workflow before execution:
 5. Build a sample impact payload for human review.
 6. Require explicit confirmation.
 7. Execute only when the confirmed SQL fingerprint still matches.
+
+Preview-only tests and step-by-step review do not mutate raw `DA` or `SA` tables. A final approved UPDATE can mutate raw tables only after every matching raw row has first been copied to `rule_engine_raw_update_backup` with the preview fingerprint as the backup scope; if the backup table is missing or coverage is incomplete, execution fails before the UPDATE.
 
 For operational deployments, keep stable raw-row identity, protected-column policy, canonical typed analysis tables, and execution logs in the private database schema. Do not mutate raw provenance columns directly.
 
