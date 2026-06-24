@@ -489,16 +489,7 @@ def parse_cases(path: Path) -> list[dict[str, str]]:
 
 
 def split_request(request: str) -> tuple[str, str]:
-    selection_markers = [" 데이터", " 광고", " row", "에서", "중"]
-    split_at = -1
-    for marker in selection_markers:
-        index = request.find(marker)
-        if index > 0:
-            split_at = max(split_at, index + len(marker))
-            break
-    if split_at <= 0:
-        return "DA/SA 데이터에서 대상 범위를 찾아줘.", request
-    return f"{request[:split_at].strip()}만 조회해줘.", request
+    return "", request
 
 
 def semantic_errors(case_number: str, summary: dict[str, Any]) -> list[str]:
@@ -538,6 +529,27 @@ def has_valid_zero_row_preview(summary: dict[str, Any]) -> bool:
         and int(summary.get("affected_row_count") or 0) == 0
         and int(summary.get("previewed_row_count") or 0) == 0
     )
+
+
+def requires_target_evidence(request_text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(request_text or "")).lower()
+    evidence_terms = [
+        "대상샘플",
+        "어떤데이터가걸리는지",
+        "미리보",
+        "preview",
+        "적용전확인",
+        "row가바뀌는지",
+        "대상만보",
+    ]
+    return any(term in compact for term in evidence_terms)
+
+
+def advisory_semantic_errors(case_number: str, request_text: str, summary: dict[str, Any]) -> list[str]:
+    errors = semantic_alignment_errors(case_number, request_text, summary)
+    if requires_target_evidence(request_text) and int(summary.get("previewed_row_count") or 0) <= 0:
+        errors.append("semantic_target_evidence_sample_missing")
+    return unique_preserve_order(errors)
 
 
 def fallback_summary_error(summary: dict[str, Any]) -> str:
@@ -590,7 +602,7 @@ def summarize_result(case_number: str, result: dict[str, Any], request_text: str
         "referenced_columns": query.get("referenced_columns", []),
     }
     summary["semantic_status"] = semantic_review_status()
-    summary["semantic_errors"] = []
+    summary["semantic_errors"] = advisory_semantic_errors(case_number, request_text, summary)
     summary["semantic_review_note"] = semantic_review_note()
     if not summary.get("sql"):
         summary["status"] = "CHECK"
@@ -598,6 +610,9 @@ def summarize_result(case_number: str, result: dict[str, Any], request_text: str
     if summary["status"] == "PASS" and int(summary.get("previewed_row_count") or 0) <= 0 and not has_valid_zero_row_preview(summary):
         summary["status"] = "CHECK"
         summary["errors"] = [*summary["errors"], "sample_preview_missing"]
+    if summary["status"] == "PASS" and summary.get("semantic_errors"):
+        summary["status"] = "CHECK"
+        summary["errors"] = [*summary["errors"], *summary["semantic_errors"]]
     if summary["status"] != "PASS" and not summary.get("errors"):
         summary["errors"] = [fallback_summary_error(summary)]
     return summary
@@ -663,6 +678,9 @@ def summarize_multistep_result(case_number: str, result: dict[str, Any], selecti
     ]
     if missing_samples:
         errors.append(f"step_sample_preview_missing: {', '.join(missing_samples)}")
+    semantic_errors = unique_preserve_order(
+        [error for item in step_summaries for error in item.get("semantic_errors", [])]
+    )
     return {
         "status": "PASS" if not errors else "CHECK",
         "raw_status": "PASS" if not errors else "CHECK",
@@ -676,7 +694,7 @@ def summarize_multistep_result(case_number: str, result: dict[str, Any], selecti
         "sql": "\n\n".join(str(item.get("sql") or "") for item in step_summaries if item.get("sql")),
         "errors": errors,
         "semantic_status": semantic_review_status(),
-        "semantic_errors": [],
+        "semantic_errors": semantic_errors,
         "semantic_review_note": "OMO must judge each step; all steps must be semantically correct for linked-question semantic PASS.",
         "step_summaries": step_summaries,
     }

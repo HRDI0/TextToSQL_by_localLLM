@@ -451,7 +451,7 @@ LLM 요청은 IR 구조화와 UPDATE action-plan 생성에만 사용한다. SQL 
 
 `scripts/run_langgraph_test_cases.py`는 review-only regression harness다. DB write를 수행하는 confirmation flow와 구분해야 한다.
 
-Regression 결과의 `PASS`는 generated SQL candidate가 validation을 통과하고 review preview를 만들 수 있는지에 대한 query executability 지표다. 자연어 요청, SQL, sample row 결과의 의미적 정합성은 deterministic code가 판정하지 않는다. raw report는 semantic review required 상태를 남기고, 사람이 각 case를 검토해 semantic PASS/FAIL을 별도 기록한다. 연결된 multi-step request는 step별 query result와 step별 semantic judgment를 분리해 기록하며, 모든 step이 의미적으로 맞을 때만 전체 semantic PASS로 취급한다. Semantic review required 상태가 남은 raw report는 comparison graph의 semantic PASS 집계 입력으로 쓰지 않는다.
+Regression 결과의 `PASS`는 generated SQL candidate가 validation을 통과하고 review preview를 만들 수 있는지에 대한 query executability 지표다. 단, deterministic advisory check가 명백한 요청-SQL-sample 불일치를 발견하면 query result는 `CHECK`로 낮춰 거짓 PASS를 막는다. 자연어 요청, SQL, sample row 결과의 최종 의미적 정합성은 deterministic code가 확정하지 않는다. raw report는 semantic review required 상태를 남기고, 사람이 각 case를 검토해 semantic PASS/FAIL을 별도 기록한다. 연결된 multi-step request는 step별 query result와 step별 semantic judgment를 분리해 기록하며, 모든 step이 의미적으로 맞을 때만 전체 semantic PASS로 취급한다. Semantic review required 상태가 남은 raw report는 comparison graph의 semantic PASS 집계 입력으로 쓰지 않는다.
 
 Model comparison graph는 전체 run 평균으로 합치지 않고 model, test suite, run 단위의 PASS/semantic PASS percentage를 표시한다.
 

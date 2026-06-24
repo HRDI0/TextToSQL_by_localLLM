@@ -38,7 +38,7 @@
 
 ### 4.1 평가 기준 분리
 
-먼저 Query PASS와 Semantic PASS를 분리했습니다. Query PASS는 SQL 후보 생성, validation, preview 가능 여부를 중심으로 판단했습니다. 반면 Semantic PASS는 자연어 요청, SQL, 샘플 row가 서로 맞는지 직접 확인했습니다.
+먼저 Query PASS와 Semantic PASS를 분리했습니다. Query PASS는 SQL 후보 생성, validation, preview 가능 여부를 중심으로 판단했습니다. 이후 명백한 요청-SQL-sample 불일치를 발견하는 deterministic advisory check는 query 결과를 `CHECK`로 낮춰 거짓 PASS를 막되, 최종 Semantic PASS 자체는 사람이 자연어 요청, SQL, 샘플 row가 서로 맞는지 직접 확인한 경우에만 기록하도록 분리했습니다.
 
 이 분리는 중요했습니다. 예를 들어 쿼리가 문법적으로 맞고 preview도 가능하더라도, 요청한 metric이 아닌 다른 metric을 보정하거나, 집계 요청인데 샘플 결과가 없거나, count 요청인데 COUNT가 없는 경우는 Semantic FAIL로 봐야 했습니다.
 

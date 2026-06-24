@@ -78,4 +78,4 @@ If any condition fails, the workflow returns a skipped or blocked execution resu
 
 ## Test Artifacts
 
-The markdown test runner writes review artifacts under `test/`. Query PASS means the candidate SQL validated and produced a preview. Semantic PASS is a separate human review of the natural-language request, generated SQL, and sample evidence. Public docs should report only sanitized aggregate outcomes and avoid including raw samples or private source values.
+The markdown test runner writes review artifacts under `test/`. Query PASS means the candidate SQL validated and produced a preview, unless deterministic advisory checks find a clear request-SQL-sample mismatch and downgrade the query result to CHECK. Semantic PASS is a separate human review of the natural-language request, generated SQL, and sample evidence. Public docs should report only sanitized aggregate outcomes and avoid including raw samples or private source values.

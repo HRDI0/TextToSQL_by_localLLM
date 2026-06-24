@@ -498,6 +498,14 @@ def compile_conditions_to_where(
     return combine_where_predicates(*compiled_parts)
 
 
+def has_condition_groups(modification_logic: dict[str, Any]) -> bool:
+    return any(
+        bool(group.get("conditions"))
+        for group in modification_logic.get("condition_groups", [])
+        if isinstance(group, dict)
+    )
+
+
 def compact_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).lower()
 
@@ -696,8 +704,8 @@ def read_only_conditions_to_where(state: ModificationWorkflowState, table_column
             table_columns,
             state.get("column_alias_mappings", []),
         )
-    except ValueError:
-        return {"sql": "1 = 1", "params": [], "columns": [], "predicate": []}
+    except ValueError as exc:
+        return {"sql": "1 = 1", "params": [], "columns": [], "predicate": [], "compile_error": str(exc), "scope_status": "failed"}
 
 
 def combine_where_predicates(*parts: dict[str, Any]) -> dict[str, Any]:
@@ -1229,8 +1237,11 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
 
     selection_where = compile_selection_scope_to_where(selection_request, table_columns, state.get("source_channel_values", {}))
     modification_where = read_only_conditions_to_where(state, table_columns)
+    if modification_where.get("scope_status") == "failed":
+        raise ValueError(f"semantic_scope_compile_failed: {modification_where.get('compile_error')}")
     precompiled_where = combine_where_predicates(selection_where, modification_where)
     modification_logic = state.get("modification_logic", {})
+    expected_predicate_required = has_condition_groups(modification_logic)
     text = aggregate_context_text(state, modification_logic)
     column_alias_mappings = state.get("column_alias_mappings", [])
     group_by_columns = [
@@ -1301,6 +1312,8 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         "reason": "intent_type=SELECT_AGGREGATE; deterministic code rendered aggregate SELECT from IR, live schema, and linked-step overlay deltas.",
         "actions": [],
         "predicate": precompiled_where.get("predicate", []),
+        "expected_predicate_required": expected_predicate_required,
+        "scope_status": "compiled" if not expected_predicate_required or modification_where.get("predicate") else "missing_expected_predicate",
         "overlay_delta_count": len(overlay_columns),
         "sql_fingerprint": fingerprint_sql(sql, params),
     }
@@ -1314,7 +1327,10 @@ def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_co
         raise ValueError("select_detail_requires_live_target_table")
     selection_where = compile_selection_scope_to_where(selection_request, table_columns, state.get("source_channel_values", {}))
     modification_where = read_only_conditions_to_where(state, table_columns)
+    if modification_where.get("scope_status") == "failed":
+        raise ValueError(f"semantic_scope_compile_failed: {modification_where.get('compile_error')}")
     precompiled_where = combine_where_predicates(selection_where, modification_where)
+    expected_predicate_required = has_condition_groups(state.get("modification_logic", {}))
     where_sql = precompiled_where.get("sql", "1 = 1")
     context = state.get("effective_preview_context", {})
     source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, context if isinstance(context, dict) else {})
@@ -1330,6 +1346,8 @@ def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_co
         "reason": "intent_type=SELECT_DETAIL; rendered row-level SELECT inside the first requested scope with linked-step overlay deltas.",
         "actions": [],
         "predicate": precompiled_where.get("predicate", []),
+        "expected_predicate_required": expected_predicate_required,
+        "scope_status": "compiled" if not expected_predicate_required or modification_where.get("predicate") else "missing_expected_predicate",
         "overlay_delta_count": len(overlay_columns),
         "sql_fingerprint": fingerprint_sql(sql, params),
     }
@@ -1842,7 +1860,12 @@ def validate_sql_with_script(
     known_columns = set(table_columns.get(table_name, [])) if table_name else set()
     if sql_type == "SELECT":
         unknown_columns = [column for column in declared_columns if column not in known_columns]
-        column_check_passed = bool(declared_columns) and not unknown_columns
+        select_star_allowed = (
+            not declared_columns
+            and bool(known_columns)
+            and re.match(r"^\s*SELECT\s+\*\s+FROM\b", sql, flags=re.IGNORECASE) is not None
+        )
+        column_check_passed = (bool(declared_columns) and not unknown_columns) or select_star_allowed
     else:
         unknown_columns = [column for column in referenced_columns if column not in known_columns]
         column_check_passed = declared_columns == parsed_columns and bool(referenced_columns) and not unknown_columns
@@ -1858,6 +1881,12 @@ def validate_sql_with_script(
         errors.append("write_sql_requires_where_review")
     else:
         checks.append("where_policy_checked")
+    if sql_type == "SELECT" and sql_candidate.get("expected_predicate_required") and not any(
+        item.get("source") == "modification" for item in sql_candidate.get("predicate", []) if isinstance(item, dict)
+    ):
+        errors.append("select_requires_semantic_predicate")
+    elif sql_type == "SELECT":
+        checks.append("select_semantic_predicate_checked")
     if sql.count("%s") == len(sql_candidate.get("params", [])):
         checks.append("parameter_count_matches")
     else:

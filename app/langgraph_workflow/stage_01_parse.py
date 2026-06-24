@@ -64,6 +64,7 @@ schema에 없는 table, column, source_channel을 임의로 만들지 않는다.
 
 의도 분류 규칙:
 - 보고 싶어, 조회, 확인, 목록, 샘플처럼 원본 데이터를 보는 요청은 intent_type="SELECT_DETAIL"다.
+- 단, 0으로/보정/채워/바꿔/고정 같은 수정 요청 뒤에 붙은 "대상 샘플 보여줘", "어떤 데이터가 걸리는지 확인해줘", "미리 보여줘", "preview 보여줘", "적용 전 확인해줘", "row가 바뀌는지 보여줘", "대상만 보여줘"는 별도 SELECT_DETAIL step이 아니다. 선행 수정 group의 output_requirements에 target_sample before_after로 기록한다.
 - 합계, 평균, 전환율, 전환당 비용, 클릭률, 비교, 계산처럼 지표 계산을 명시한 경우만 intent_type="SELECT_AGGREGATE"다.
 - 0으로, 보정, 채워, 바꿔, 고정은 intent_type="UPDATE_NUMERIC_VALUE"다.
 - 새 컬럼, 새 구분, 새 항목, 만들어, 기입, 붙여줘, 분류값, 상태값, 임시 상태값은 intent_type="ADD_DERIVED_COLUMN"다.
@@ -109,6 +110,7 @@ business column alias mappings, business metric definitions만 사용한다. 코
         "depends_on": [],
         "conditions": [{{"field": string, "operator": "eq/in/contains/is_null_or_empty/gt/gte/lt/lte/between/or", "values": list, "conditions": list}}],
         "actions": [{{"target_field": string, "operation": "set_literal", "value": string}}],
+        "output_requirements": [{{"type": "target_sample", "mode": "before_after", "limit": 2}}],
         "group_by": [{{"field_alias": string, "resolved_column": string}}],
         "metrics": [{{"alias": string, "expression_type": "sum/avg/count/conversion_rate/cost_per_conversion/ctr", "source_column": string}}],
         "derived_column": object
@@ -213,6 +215,16 @@ DIMENSION_FIELD_ALIASES = {
 NUMERIC_PRESENCE_TERMS = ("있는", "있고", "있으며", "있는데", "들어간", "나온", "잡힌", "발생", "기록된", "찍힌", "1회이상", "1원이상", "0보다큰", "양수")
 NUMERIC_ZERO_TERMS = ("없는", "없고", "없으며", "없는데", "0인", "0회", "0원")
 EMPTY_TERMS = ("비어", "빈값", "누락", "공란", "null", "none")
+PREVIEW_OUTPUT_TERMS = (
+    "대상샘플",
+    "어떤데이터가걸리는지",
+    "미리보",
+    "preview",
+    "적용전확인",
+    "row가바뀌는지",
+    "대상만보",
+)
+SEPARATE_DETAIL_TERMS = ("없는건은샘플", "없는row샘플", "없는행샘플", "샘플만따로")
 MEDIA_TABLE_TERMS = {
     "SA": ("검색광고", "검색 광고"),
     "DA": ("디스플레이광고", "디스플레이 광고", "배너광고", "배너 광고"),
@@ -336,6 +348,67 @@ def coerce_numeric_presence_conditions(ir: dict[str, Any], source_text: str) -> 
     return {**ir, "modification": modification}
 
 
+def preview_output_requested(text: str) -> bool:
+    compact = compact_text(text)
+    return any(term in compact for term in PREVIEW_OUTPUT_TERMS)
+
+
+def separate_detail_requested(text: str) -> bool:
+    compact = compact_text(text)
+    return any(term in compact for term in SEPARATE_DETAIL_TERMS)
+
+
+def is_preview_only_detail_group(group: dict[str, Any]) -> bool:
+    return (
+        str(group.get("intent_type") or "").upper() == SELECT_DETAIL_INTENT
+        and not group.get("actions")
+        and not group.get("metrics")
+        and not group.get("group_by")
+        and not group.get("derived_column")
+    )
+
+
+def is_mutating_group(group: dict[str, Any]) -> bool:
+    return str(group.get("intent_type") or "").upper() in {UPDATE_INTENT, ADD_DERIVED_COLUMN_INTENT} and bool(group.get("actions") or group.get("derived_column"))
+
+
+def with_target_sample_requirement(group: dict[str, Any]) -> dict[str, Any]:
+    requirements = [item for item in group.get("output_requirements", []) if isinstance(item, dict)]
+    target_sample = {"type": "target_sample", "mode": "before_after", "limit": 2}
+    if not any(item.get("type") == target_sample["type"] and item.get("mode") == target_sample["mode"] for item in requirements):
+        requirements.append(target_sample)
+    return {**group, "output_requirements": requirements}
+
+
+def collapse_preview_only_detail_steps(ir: dict[str, Any], user_text: str) -> dict[str, Any]:
+    if not preview_output_requested(user_text) or separate_detail_requested(user_text):
+        return ir
+    modification = dict(ir.get("modification", {}))
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    collapsed: list[dict[str, Any]] = []
+    changed = False
+    for group in groups:
+        if is_preview_only_detail_group(group) and collapsed and is_mutating_group(collapsed[-1]):
+            collapsed[-1] = with_target_sample_requirement(collapsed[-1])
+            changed = True
+            continue
+        collapsed.append(group)
+    with_requirements: list[dict[str, Any]] = []
+    for group in collapsed:
+        if is_mutating_group(group):
+            with_requirements.append(with_target_sample_requirement(group))
+            changed = True
+        else:
+            with_requirements.append(group)
+    if not changed:
+        return ir
+    modification["condition_groups"] = with_requirements
+    updated = {**ir, "modification": modification}
+    if len(with_requirements) == 1:
+        updated["intent_type"] = with_requirements[0].get("intent_type") or updated.get("intent_type")
+    return updated
+
+
 def classify_intent(selection_text: str, modification_text: str) -> str:
     text = f"{selection_text} {modification_text}".lower()
     if any(keyword in text for keyword in ["합계", "평균", "건수", "몇 건", "몇건", "row 수", "행 수", "전환율", "전환당", "클릭률", "비교", "계산", "count", "ctr", "cpc", "cpa"]):
@@ -411,6 +484,7 @@ def normalize_ir_structured_json(parsed: dict[str, Any]) -> dict[str, Any]:
                 "group_by": group.get("group_by") or (top_level_group_by if group_intent == AGGREGATE_INTENT else []),
                 "metrics": group.get("metrics") or (top_level_metrics if group_intent == AGGREGATE_INTENT else []),
                 "derived_column": group.get("derived_column") or (top_level_derived if group_intent == ADD_DERIVED_COLUMN_INTENT else {}),
+                "output_requirements": [item for item in group.get("output_requirements", []) if isinstance(item, dict)],
             }
         )
     modification = dict(parsed["modification"])
@@ -468,6 +542,7 @@ def build_workflow_steps(modification: dict[str, Any]) -> list[dict[str, Any]]:
             "group_by": group.get("group_by", []),
             "metrics": group.get("metrics", []),
             "derived_column": group.get("derived_column", {}),
+            "output_requirements": group.get("output_requirements", []),
             "status": status,
         })
     return steps
@@ -500,6 +575,7 @@ def build_linked_step_plan(selection: dict[str, Any], modification: dict[str, An
                 "group_by": group.get("group_by", []),
                 "metrics": group.get("metrics", []),
                 "derived_column": group.get("derived_column", {}),
+                "output_requirements": group.get("output_requirements", []),
                 "expected_artifacts": ["sql_candidate", "validation_result", "change_preview_json", "user_confirmation"],
                 "execution_gate": "preview_first_approval_required",
                 "status": "planned" if dependency == "independent" or depends_on else "blocked",
@@ -788,6 +864,7 @@ def parse_ir_with_llm(llm: Any, selection_text: str, modification_text: str, sch
     elif not normalized.get("intent_type") or (normalized.get("intent_type") == ASK_CLARIFICATION_INTENT and classified_intent != ASK_CLARIFICATION_INTENT):
         normalized = force_classified_intent(normalized, classified_intent)
     normalized = coerce_numeric_presence_conditions(normalized, f"{selection_text} {modification_text}")
+    normalized = collapse_preview_only_detail_steps(normalized, f"{selection_text} {modification_text}")
     return normalized
 
 
@@ -818,6 +895,7 @@ def parse_ir_request_node(state: ModificationWorkflowState, llm: Any = None) -> 
     )
     ir_structured_json["selection"] = remove_resolved_modification_terms(ir_structured_json["selection"], ir_structured_json["modification"])
     ir_structured_json = coerce_numeric_presence_conditions(ir_structured_json, f"{state['selection_text']} {state['modification_text']}")
+    ir_structured_json = collapse_preview_only_detail_steps(ir_structured_json, f"{state['selection_text']} {state['modification_text']}")
     ir_structured_json["selection"]["intent_type"] = ir_structured_json.get("intent_type")
     ir_structured_json["modification"]["intent_type"] = ir_structured_json.get("intent_type")
     workflow_steps = build_workflow_steps(ir_structured_json["modification"])
