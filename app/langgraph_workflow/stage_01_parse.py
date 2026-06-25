@@ -200,6 +200,82 @@ def normalize_actions(raw_actions: Any) -> list[dict[str, Any]]:
     return actions
 
 
+def parse_explicit_numeric_update_value(text: str) -> str | None:
+    patterns = [
+        r"(-?\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:원|회|건)?\s*(?:으로|로)\s*(?:보정|수정|변경|바꾸|고정|채우)",
+        r"(?:보정|수정|변경|바꾸|고정|채우)\S{0,8}?\s*(-?\d+(?:,\d{3})*(?:\.\d+)?)\s*(?:원|회|건)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).replace(",", "")
+    return None
+
+
+def numeric_alias_tokens() -> list[str]:
+    aliases = {field for field in NUMERIC_FIELD_ALIASES}
+    for field_aliases in NUMERIC_FIELD_ALIASES.values():
+        aliases.update(field_aliases)
+    return sorted((alias for alias in aliases if alias), key=len, reverse=True)
+
+
+def next_numeric_alias_start(text: str, offset: int) -> int:
+    starts: list[int] = []
+    for alias in numeric_alias_tokens():
+        match = re.search(re.escape(alias), text[offset:])
+        if match:
+            starts.append(offset + match.start())
+    return min(starts) if starts else len(text)
+
+
+def parse_numeric_update_value_for_field(text: str, field: str) -> str | None:
+    aliases = [field, *NUMERIC_FIELD_ALIASES.get(field, ())]
+    for alias in aliases:
+        alias_token = re.escape(str(alias))
+        for alias_match in re.finditer(alias_token, text):
+            segment_end = next_numeric_alias_start(text, alias_match.end())
+            segment = text[alias_match.start() : segment_end]
+            patterns = [
+                rf"{alias_token}\s*(?:은|는|이|가|을|를)?\s*(-?\d+(?:,\d{{3}})*(?:\.\d+)?)\s*(?:원|회|건)?\s*(?:으로|로)?\s*(?:보정|수정|변경|바꾸|고정|정리|맞추)",
+                rf"{alias_token}[^,.;\n]{{0,16}}?(-?\d+(?:,\d{{3}})*(?:\.\d+)?)\s*(?:원|회|건)?\s*(?:으로|로)",
+                rf"(-?\d+(?:,\d{{3}})*(?:\.\d+)?)\s*(?:원|회|건)?\s*(?:으로|로)[^,.;\n]{{0,16}}?{alias_token}",
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, segment)
+                if match:
+                    return match.group(1).replace(",", "")
+        compact = compact_text(text)
+        if compact_text(alias) in compact and "보정" in compact:
+            return "0"
+    return None
+
+
+def coerce_numeric_action_values(ir: dict[str, Any], source_text: str) -> dict[str, Any]:
+    explicit_value = parse_explicit_numeric_update_value(source_text)
+    modification = dict(ir.get("modification", {}))
+    groups: list[dict[str, Any]] = []
+    for group in modification.get("condition_groups", []):
+        if not isinstance(group, dict):
+            continue
+        actions: list[dict[str, Any]] = []
+        for action in group.get("actions", []):
+            if not isinstance(action, dict):
+                continue
+            target = canonical_numeric_field(action.get("target_field") or action.get("target_column"))
+            operation = action.get("operation") or action.get("action_type")
+            if target and operation in {"set_literal", "set_value", "set_zero", None}:
+                action_value = parse_numeric_update_value_for_field(source_text, target) or explicit_value
+                if action_value is None:
+                    actions.append(action)
+                    continue
+                operation = "set_zero" if action_value == "0" else "set_literal"
+                action = {**action, "target_field": target, "operation": operation, "value": action_value}
+            actions.append(action)
+        groups.append({**group, "actions": actions})
+    modification["condition_groups"] = groups
+    return {**ir, "modification": modification}
+
+
 NUMERIC_FIELD_ALIASES = {
     "노출수": ("노출", "노출수", "노출 수", "노출량", "조회수", "impression", "impressions"),
     "클릭수": ("클릭", "클릭수", "클릭 수", "클리크", "click", "clicks"),
@@ -286,6 +362,12 @@ def numeric_zero_requested(text: str, field: str) -> bool:
     return text_mentions_field_with_terms(text, field, NUMERIC_ZERO_TERMS) and not text_mentions_field_with_terms(text, field, EMPTY_TERMS)
 
 
+def numeric_field_mentioned(text: str, field: str) -> bool:
+    compact = compact_text(text)
+    aliases = NUMERIC_FIELD_ALIASES.get(field, (field,))
+    return any(compact_text(alias) in compact for alias in aliases)
+
+
 def coerce_condition_numeric_presence(condition: dict[str, Any], source_text: str) -> dict[str, Any]:
     operator = str(condition.get("operator", "")).lower()
     if operator in {"or", "and"}:
@@ -337,6 +419,11 @@ def coerce_numeric_presence_conditions(ir: dict[str, Any], source_text: str) -> 
             coerce_condition_numeric_presence(condition, source_text)
             for condition in group.get("conditions", [])
             if isinstance(condition, dict)
+        ]
+        conditions = [
+            condition
+            for condition in conditions
+            if not (canonical_numeric_field(condition.get("field")) and not numeric_field_mentioned(source_text, canonical_numeric_field(condition.get("field"))))
         ]
         for target in sorted(action_numeric_targets(group)):
             if numeric_zero_requested(source_text, target) and not any(condition_targets_field(condition, target) for condition in conditions):
@@ -407,6 +494,52 @@ def collapse_preview_only_detail_steps(ir: dict[str, Any], user_text: str) -> di
     if len(with_requirements) == 1:
         updated["intent_type"] = with_requirements[0].get("intent_type") or updated.get("intent_type")
     return updated
+
+
+def text_implies_prior_update_dependency(text: str) -> bool:
+    compact = compact_text(text)
+    dependency_terms = (
+        "보정후",
+        "수정후",
+        "변경후",
+        "바꾼후",
+        "고정후",
+        "적용후",
+        "그결과",
+        "그값",
+        "수정결과",
+        "보정결과",
+        "이후",
+        "다음",
+    )
+    return any(term in compact for term in dependency_terms)
+
+
+def infer_sequential_dependencies(ir: dict[str, Any], user_text: str) -> dict[str, Any]:
+    if not text_implies_prior_update_dependency(user_text):
+        return ir
+    modification = dict(ir.get("modification", {}))
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    if len(groups) <= 1:
+        return ir
+    last_mutating_id = ""
+    changed = False
+    updated_groups: list[dict[str, Any]] = []
+    for index, group in enumerate(groups):
+        group_id = str(group.get("group_id") or f"step_{index + 1}")
+        current = {**group, "group_id": group_id}
+        intent = str(current.get("intent_type") or "").upper()
+        if last_mutating_id and intent in {SELECT_DETAIL_INTENT, AGGREGATE_INTENT} and not current.get("depends_on"):
+            current["dependency"] = "dependent"
+            current["depends_on"] = [last_mutating_id]
+            changed = True
+        if is_mutating_group(current):
+            last_mutating_id = group_id
+        updated_groups.append(current)
+    if not changed:
+        return ir
+    modification["condition_groups"] = updated_groups
+    return {**ir, "modification": modification}
 
 
 def classify_intent(selection_text: str, modification_text: str) -> str:
@@ -863,8 +996,11 @@ def parse_ir_with_llm(llm: Any, selection_text: str, modification_text: str, sch
         normalized = force_classified_intent(normalized, classified_intent)
     elif not normalized.get("intent_type") or (normalized.get("intent_type") == ASK_CLARIFICATION_INTENT and classified_intent != ASK_CLARIFICATION_INTENT):
         normalized = force_classified_intent(normalized, classified_intent)
-    normalized = coerce_numeric_presence_conditions(normalized, f"{selection_text} {modification_text}")
-    normalized = collapse_preview_only_detail_steps(normalized, f"{selection_text} {modification_text}")
+    source_text = f"{selection_text} {modification_text}"
+    normalized = coerce_numeric_presence_conditions(normalized, source_text)
+    normalized = coerce_numeric_action_values(normalized, source_text)
+    normalized = collapse_preview_only_detail_steps(normalized, source_text)
+    normalized = infer_sequential_dependencies(normalized, source_text)
     return normalized
 
 
@@ -894,8 +1030,11 @@ def parse_ir_request_node(state: ModificationWorkflowState, llm: Any = None) -> 
         table_columns=state.get("table_columns", {}),
     )
     ir_structured_json["selection"] = remove_resolved_modification_terms(ir_structured_json["selection"], ir_structured_json["modification"])
-    ir_structured_json = coerce_numeric_presence_conditions(ir_structured_json, f"{state['selection_text']} {state['modification_text']}")
-    ir_structured_json = collapse_preview_only_detail_steps(ir_structured_json, f"{state['selection_text']} {state['modification_text']}")
+    source_text = f"{state['selection_text']} {state['modification_text']}"
+    ir_structured_json = coerce_numeric_presence_conditions(ir_structured_json, source_text)
+    ir_structured_json = coerce_numeric_action_values(ir_structured_json, source_text)
+    ir_structured_json = collapse_preview_only_detail_steps(ir_structured_json, source_text)
+    ir_structured_json = infer_sequential_dependencies(ir_structured_json, source_text)
     ir_structured_json["selection"]["intent_type"] = ir_structured_json.get("intent_type")
     ir_structured_json["modification"]["intent_type"] = ir_structured_json.get("intent_type")
     workflow_steps = build_workflow_steps(ir_structured_json["modification"])
