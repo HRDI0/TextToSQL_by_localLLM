@@ -311,10 +311,11 @@ def expected_zero_update_columns(text: str) -> list[str]:
     expected: list[str] = []
     for token, column in METRIC_COLUMNS.items():
         token_compact = compact_text(token)
+        nonzero_assignment = re.search(token_compact + r".{0,8}(?:[1-9][0-9]*)(?:으로|로)", compact)
         if (
             re.search(token_compact + r"(을|를).{0,8}0으로", compact)
             or re.search(token_compact + r"0으로", compact)
-            or re.search(token_compact + r".{0,8}(보정|정리|맞추|바꾸)", compact)
+            or (not nonzero_assignment and re.search(token_compact + r".{0,8}(보정|정리|맞추|바꾸)", compact))
         ):
             expected.append(column)
     if "세값" in compact and all(token in compact for token in ["노출", "클릭", "비용"]):

@@ -32,6 +32,7 @@ nohup.out
 tmp/
 temp/
 .cache/
+test/
 
 # Local Docker Compose configuration
 compose.yaml
@@ -51,7 +52,6 @@ docs/**
 !docs/
 !docs/public/
 !docs/public/**
-test/
 # Internal database schema and migration files
 migrations/
 !migrations/

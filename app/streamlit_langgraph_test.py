@@ -27,15 +27,15 @@ from app.langgraph_workflow import (
     build_modification_workflow_graph,
     connect_db,
 )
-from app.langgraph_workflow.stage_04_output import build_final_output_json, can_execute, ensure_linked_plan, execute_confirmed_sql, update_delta_status
+from app.langgraph_workflow.stage_04_output import build_final_output_json, can_execute, ensure_linked_plan, execute_confirmed_sql, request_fingerprint, update_delta_status
 
 
 SELECTION_PLACEHOLDER = "예: 5월 검색광고를 확인하고 싶어."
 MODIFICATION_PLACEHOLDER = "예: 검색광고에서 클릭이 있는 데이터는 클릭을 0으로 맞춰줘."
 STORED_RULES_PLACEHOLDER = "개발용 저장 규칙이 없으면 비워두세요."
 DEFAULT_LLM_BASE_URL = "http://127.0.0.1:8000/v1"
-DEFAULT_LLM_MODEL = "qwen3-14b"
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+DEFAULT_LLM_MODEL = DEFAULT_GEMINI_MODEL
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 LOGGER = logging.getLogger(__name__)
 WORKFLOW_SESSION_KEYS = {
@@ -48,6 +48,7 @@ WORKFLOW_SESSION_KEYS = {
     "step_preview_signatures",
     "step_invalidated_previews",
     "linked_final_execution_results",
+    "request_fingerprint",
 }
 INPUT_SESSION_KEYS = {"selection_text", "modification_text", "stored_rules_json"}
 
@@ -83,6 +84,17 @@ def clear_results_on_input_change() -> None:
         clear_workflow_state(clear_inputs=False)
 
 
+def current_request_fingerprint(selection_text: str, modification_text: str, steps: list[dict[str, Any]] | None = None) -> str:
+    return request_fingerprint(selection_text, modification_text, steps or [])
+
+
+def request_scope_for_run(selection_text: str, modification_text: str, steps: list[dict[str, Any]] | None = None, linked_plan_id: int | None = None) -> dict[str, Any]:
+    return {
+        "request_fingerprint": current_request_fingerprint(selection_text, modification_text, steps),
+        "linked_plan_id": linked_plan_id,
+    }
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -101,7 +113,7 @@ def parse_stored_rules(raw_json: str) -> list[dict[str, Any]]:
 
 
 def build_local_llm() -> Any:
-    provider = str(session_value("llm_provider") or os.environ.get("SQL_WORKFLOW_LLM_PROVIDER", "openai_compatible")).strip()
+    provider = str(session_value("llm_provider") or os.environ.get("SQL_WORKFLOW_LLM_PROVIDER", "gemini_native")).strip()
     base_url = str(os.environ.get("SQL_WORKFLOW_LLM_BASE_URL", DEFAULT_LLM_BASE_URL)).strip()
     model = str(session_value("llm_model") or os.environ.get("SQL_WORKFLOW_LLM_MODEL", DEFAULT_LLM_MODEL)).strip()
     api_key = str(session_value("llm_api_key") or os.environ.get("SQL_WORKFLOW_LLM_API_KEY", "EMPTY")).strip()
@@ -175,6 +187,7 @@ def run_graph(
     active_step_id: str | None = None,
     effective_preview_context: dict[str, Any] | None = None,
     linked_plan_id: int | None = None,
+    request_scope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = build_demo_state(approved=approved, stored_rules=stored_rules)
     state.update(
@@ -191,6 +204,10 @@ def run_graph(
         state["active_step_id"] = active_step_id
     if linked_plan_id:
         state["linked_plan_id"] = linked_plan_id
+    scope = request_scope or request_scope_for_run(selection_text, modification_text, linked_plan_id=linked_plan_id)
+    cast(dict[str, Any], state)["request_scope"] = scope
+    if scope.get("request_fingerprint"):
+        cast(dict[str, Any], state)["request_fingerprint"] = scope["request_fingerprint"]
     if effective_preview_context:
         state["effective_preview_context"] = effective_preview_context
     if ir_override:
@@ -267,6 +284,12 @@ def show_final_result(result: dict[str, Any]) -> None:
     query_from_ir = output.get("query_from_ir", {})
     sql_text = query_from_ir.get("sql") or f"-- SQL not generated\n-- reason: {query_from_ir.get('reason') or result.get('errors', [])}"
     st.code(sql_text, language="sql", wrap_lines=True)
+    with st.expander("쿼리 실행 증거", expanded=True):
+        st.json({
+            "request_fingerprint": output.get("request_fingerprint"),
+            "request_scope": output.get("request_scope", {}),
+            "evidence_bundle": query_from_ir.get("evidence_bundle", output.get("evidence_bundle", {})),
+        })
     st.caption("이 명령은 승인 버튼을 누르기 전에는 실행되지 않습니다. 먼저 아래 샘플 데이터로 대상이 맞는지 확인하세요.")
 
     st.subheader("3. 샘플 데이터")
@@ -505,6 +528,8 @@ def normalize_step_source_channel_conditions(group: dict[str, Any], table: str, 
             values: list[str] = []
             for value in condition.get("values", []):
                 value_table, source = split_source_channel_value(value)
+                if source == "*":
+                    continue
                 qualifier = field_table or value_table
                 if qualifier and qualifier != table:
                     continue
@@ -639,6 +664,37 @@ def overlay_columns_from_result(result: dict[str, Any]) -> list[str]:
     return [column for column in columns if not (column in seen or seen.add(column))]
 
 
+def visible_evidence_bundle(result: dict[str, Any]) -> dict[str, Any]:
+    existing = result.get("evidence_bundle") or result.get("change_preview_json", {}).get("evidence_bundle")
+    if isinstance(existing, dict) and existing.get("required_evidence_columns"):
+        return existing
+    sql_candidate = result.get("sql_candidate", {})
+    preview_rows = result.get("preview_rows", [])
+    preview_delta_items = preview_delta_items_from_result(result, "pending")
+    action_columns = [str(action.get("target_field")) for action in sql_candidate.get("actions", []) if isinstance(action, dict) and action.get("target_field")]
+    predicate_columns = [str(item.get("column")) for item in sql_candidate.get("predicate", []) if isinstance(item, dict) and item.get("column")]
+    referenced_columns = [str(column) for column in sql_candidate.get("referenced_columns", []) if str(column)]
+    changed_columns = [
+        str(column)
+        for item in preview_delta_items
+        if isinstance(item.get("after"), dict)
+        for column in item["after"].keys()
+    ]
+    context = result.get("effective_preview_context", {})
+    overlay_columns = [str(column) for column in context.get("overlay_columns", []) if str(column)] if isinstance(context, dict) else []
+    return {
+        "required_evidence_columns": unique_preserve_order([*referenced_columns, *predicate_columns, *action_columns, *overlay_columns, *changed_columns]),
+        "query_executed": bool(sql_candidate.get("sql") and preview_rows is not None),
+        "overlay_sources": {
+            "linked_plan_id": context.get("linked_plan_id") if isinstance(context, dict) else None,
+            "overlay_step_keys": context.get("overlay_step_keys", []) if isinstance(context, dict) else [],
+            "overlay_columns": overlay_columns,
+            "derived_overlay_columns": context.get("derived_overlay_columns", []) if isinstance(context, dict) else [],
+        },
+        "proof_row_count": len(preview_rows) if isinstance(preview_rows, list) else 0,
+    }
+
+
 def effective_preview_context_for_step(
     steps: list[dict[str, Any]],
     step_id: str,
@@ -650,6 +706,7 @@ def effective_preview_context_for_step(
     dependency_ancestors = ancestor_step_ids(steps, step_id)
     overlay_columns: list[str] = []
     overlay_step_keys: list[str] = []
+    derived_overlay_columns: list[str] = []
     for step in steps:
         prior_id = str(step.get("step_id") or step.get("group_id"))
         if prior_id not in accepted or step_order_for_id(steps, prior_id) >= current_order:
@@ -658,11 +715,15 @@ def effective_preview_context_for_step(
             continue
         overlay_step_keys.append(prior_id)
         overlay_columns.extend(overlay_columns_from_result(previews.get(prior_id, {})))
+        for item in preview_delta_items_from_result(previews.get(prior_id, {})):
+            if item.get("delta_type") == "preview_derived" and isinstance(item.get("after"), dict):
+                derived_overlay_columns.extend(str(column) for column in item["after"].keys())
     return {
         "linked_plan_id": linked_plan_id,
         "active_step_order": current_order,
         "overlay_columns": unique_preserve_order(overlay_columns),
         "overlay_step_keys": unique_preserve_order(overlay_step_keys),
+        "derived_overlay_columns": unique_preserve_order(derived_overlay_columns),
     }
 
 
@@ -736,13 +797,24 @@ def show_recommendations(result: dict[str, Any]) -> None:
                 updated_selection = recommendation_rerun_text(updated_selection, item)
             else:
                 updated_modification = recommendation_rerun_text(updated_modification, item)
+            stored_rules = last_input.get("stored_rules", [])
+            clear_workflow_state(clear_inputs=False)
             st.session_state.pipeline_result = run_graph(
                 selection_text=updated_selection,
                 modification_text=updated_modification,
-                stored_rules=last_input.get("stored_rules", []),
+                stored_rules=stored_rules,
                 approved=False,
             )
-            st.session_state.last_valid_input = {**last_input, "selection_text": updated_selection, "modification_text": updated_modification}
+            steps = st.session_state.pipeline_result.get("workflow_steps") or []
+            if len(steps) > 1:
+                with connect_db() as connection:
+                    linked_plan_id = ensure_linked_plan(connection, updated_selection, updated_modification, steps)
+                st.session_state.pipeline_result["linked_plan_id"] = linked_plan_id
+                st.session_state.linked_plan_id = linked_plan_id
+            else:
+                st.session_state.linked_plan_id = None
+            st.session_state.last_valid_input = {"selection_text": updated_selection, "modification_text": updated_modification, "stored_rules": stored_rules}
+            st.session_state.request_fingerprint = current_request_fingerprint(updated_selection, updated_modification, steps)
             st.session_state.accepted_step_ids = []
             st.session_state.cancelled_step_ids = []
             st.session_state.step_preview_results = {}
@@ -765,12 +837,11 @@ def show_llm_admin_controls() -> None:
     if not env_flag("SQL_WORKFLOW_ENABLE_LLM_ADMIN", False):
         return
     provider_options = {
-        "openai_compatible": "llama.cpp / OpenAI 호환",
         "gemini_native": "Gemini 기본 API",
         "gemini_openai_compatible": "Gemini OpenAI 호환",
     }
-    env_provider = os.environ.get("SQL_WORKFLOW_LLM_PROVIDER", "openai_compatible")
-    default_provider = env_provider if env_provider in provider_options else "openai_compatible"
+    env_provider = os.environ.get("SQL_WORKFLOW_LLM_PROVIDER", "gemini_native")
+    default_provider = env_provider if env_provider in provider_options else "gemini_native"
     with st.sidebar.expander("관리자 설정", expanded=False):
         provider = st.selectbox(
             "LLM provider",
@@ -864,12 +935,13 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                     active_step_id=step_id,
                     effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews, linked_plan_id),
                     linked_plan_id=linked_plan_id,
+                    request_scope=request_scope_for_run(last_input.get("selection_text", ""), last_input.get("modification_text", ""), steps, linked_plan_id),
                 )
                 signatures[step_id] = current_signature
                 st.session_state[preview_key] = previews
                 st.session_state[signature_key] = signatures
                 st.rerun()
-            if cols[1].button("이 요청 승인", key=f"approve_{step_id}", disabled=not preview_ready or not available):
+            if cols[1].button("이 요청 승인", key=f"approve_{step_id}", disabled=step_id in accepted or not preview_ready or not available):
                 previews[step_id] = apply_existing_preview_result(previews[step_id], True, execute=False)
                 accepted.add(step_id)
                 cancelled.discard(step_id)
@@ -909,7 +981,19 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                 st.session_state[stale_key] = stale_previews
                 st.rerun()
             if step_id in previews:
-                show_final_result(previews[step_id])
+                preview_result = previews[step_id]
+                output = dict(preview_result.get("output_json", {}))
+                if not output.get("request_fingerprint"):
+                    output["request_fingerprint"] = st.session_state.get("request_fingerprint")
+                if not output.get("request_scope"):
+                    output["request_scope"] = request_scope_for_run(last_input.get("selection_text", ""), last_input.get("modification_text", ""), steps, linked_plan_id)
+                query_from_ir = dict(output.get("query_from_ir", {}))
+                if not query_from_ir.get("evidence_bundle"):
+                    query_from_ir["evidence_bundle"] = visible_evidence_bundle(preview_result)
+                output["query_from_ir"] = query_from_ir
+                if not output.get("evidence_bundle"):
+                    output["evidence_bundle"] = query_from_ir["evidence_bundle"]
+                show_final_result({**preview_result, "output_json": output})
 
     available_step_ids = [str(step.get("step_id") or step.get("group_id")) for step in steps if step_is_available(step, accepted, cancelled)]
     missing_preview_ids = [
@@ -934,6 +1018,7 @@ def show_step_approval_controls(result: dict[str, Any]) -> None:
                     active_step_id=step_id,
                     effective_preview_context=effective_preview_context_for_step(steps, step_id, accepted, previews, linked_plan_id),
                     linked_plan_id=linked_plan_id,
+                    request_scope=request_scope_for_run(last_input.get("selection_text", ""), last_input.get("modification_text", ""), steps, linked_plan_id),
                 )
             signatures[step_id] = preview_signature(step_id, steps, accepted, cancelled)
         st.session_state[preview_key] = previews
@@ -992,6 +1077,7 @@ def main() -> None:
     if submitted:
         try:
             stored_rules = parse_stored_rules(stored_rules_json)
+            clear_workflow_state(clear_inputs=False)
             st.session_state.pipeline_result = run_graph(
                 selection_text=selection_text,
                 modification_text=modification_text,
@@ -1011,6 +1097,7 @@ def main() -> None:
                 "modification_text": modification_text,
                 "stored_rules": stored_rules,
             }
+            st.session_state.request_fingerprint = current_request_fingerprint(selection_text, modification_text, steps)
             st.session_state.accepted_step_ids = []
             st.session_state.cancelled_step_ids = []
             st.session_state.step_preview_results = {}

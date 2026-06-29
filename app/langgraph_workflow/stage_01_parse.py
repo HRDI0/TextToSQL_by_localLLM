@@ -28,6 +28,17 @@ def compact_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).lower()
 
 
+def unique_preserve_order(values: list[Any]) -> list[Any]:
+    seen: set[Any] = set()
+    result: list[Any] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
 def log_llm_request(stage: str, prompt: str, response: Any = None, error: Exception | None = None) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     content = response.content if response is not None and hasattr(response, "content") else None
@@ -253,6 +264,17 @@ def parse_numeric_update_value_for_field(text: str, field: str) -> str | None:
 def coerce_numeric_action_values(ir: dict[str, Any], source_text: str) -> dict[str, Any]:
     explicit_value = parse_explicit_numeric_update_value(source_text)
     modification = dict(ir.get("modification", {}))
+    numeric_targets = unique_preserve_order(
+        [
+            target
+            for group in modification.get("condition_groups", [])
+            if isinstance(group, dict)
+            for action in group.get("actions", [])
+            if isinstance(action, dict)
+            for target in [canonical_numeric_field(action.get("target_field") or action.get("target_column"))]
+            if target
+        ]
+    )
     groups: list[dict[str, Any]] = []
     for group in modification.get("condition_groups", []):
         if not isinstance(group, dict):
@@ -264,12 +286,19 @@ def coerce_numeric_action_values(ir: dict[str, Any], source_text: str) -> dict[s
             target = canonical_numeric_field(action.get("target_field") or action.get("target_column"))
             operation = action.get("operation") or action.get("action_type")
             if target and operation in {"set_literal", "set_value", "set_zero", None}:
-                action_value = parse_numeric_update_value_for_field(source_text, target) or explicit_value
+                field_value = parse_numeric_update_value_for_field(source_text, target)
+                action_value = field_value or (explicit_value if len(numeric_targets) <= 1 else None)
                 if action_value is None:
                     actions.append(action)
                     continue
                 operation = "set_zero" if action_value == "0" else "set_literal"
-                action = {**action, "target_field": target, "operation": operation, "value": action_value}
+                action = {
+                    **action,
+                    "target_field": target,
+                    "operation": operation,
+                    "value": action_value,
+                    "value_source": "field_local_text" if field_value is not None else "single_action_global_text",
+                }
             actions.append(action)
         groups.append({**group, "actions": actions})
     modification["condition_groups"] = groups
@@ -300,12 +329,22 @@ PREVIEW_OUTPUT_TERMS = (
     "row가바뀌는지",
     "대상만보",
 )
-SEPARATE_DETAIL_TERMS = ("없는건은샘플", "없는row샘플", "없는행샘플", "샘플만따로")
+SEPARATE_DETAIL_TERMS = ("없는건은샘플", "없는row샘플", "없는행샘플", "샘플만따로", "따로", "별도로", "섞지말", "합치지말")
 MEDIA_TABLE_TERMS = {
     "SA": ("검색광고", "검색 광고"),
     "DA": ("디스플레이광고", "디스플레이 광고", "배너광고", "배너 광고"),
 }
 STRUCTURAL_UNRESOLVED_TERMS = ("적혀있고", "적혀있는", "적혀", "있는", "있고", "1회이상", "1원이상")
+AGGREGATE_TERMS = ("합계", "평균", "전환율", "전환당", "클릭률", "계산", "건수")
+
+
+def media_tables_from_text(text: str) -> list[str]:
+    compact = compact_text(text)
+    return [
+        table_name
+        for table_name, terms in MEDIA_TABLE_TERMS.items()
+        if any(compact_text(term) in compact for term in terms)
+    ]
 
 
 def canonical_numeric_field(value: Any) -> str:
@@ -331,14 +370,15 @@ def text_mentions_field_with_terms(text: str, field: str, terms: tuple[str, ...]
 
 
 def infer_media_table_from_text(text: str) -> str | None:
-    compact = compact_text(text)
-    matched_tables: set[str] = set()
-    for table_name, terms in MEDIA_TABLE_TERMS.items():
-        if any(compact_text(term) in compact for term in terms):
-            matched_tables.add(table_name)
+    matched_tables = set(media_tables_from_text(text))
     if len(matched_tables) == 1:
         return next(iter(matched_tables))
     return None
+
+
+def request_clauses(text: str) -> list[str]:
+    clauses = [item.strip() for item in re.split(r"\n+|,|(?:\s*그리고\s*)|(?:\s*별도로\s*)|(?<=[.!?])\s+", text) if item.strip()]
+    return clauses or [text]
 
 
 def is_media_table_term(value: Any, table_name: str) -> bool:
@@ -435,6 +475,24 @@ def coerce_numeric_presence_conditions(ir: dict[str, Any], source_text: str) -> 
     return {**ir, "modification": modification}
 
 
+def ensure_numeric_update_predicates(ir: dict[str, Any], source_text: str) -> dict[str, Any]:
+    modification = dict(ir.get("modification", {}))
+    groups: list[dict[str, Any]] = []
+    for group in modification.get("condition_groups", []):
+        if not isinstance(group, dict):
+            continue
+        conditions = [condition for condition in group.get("conditions", []) if isinstance(condition, dict)]
+        for target in sorted(action_numeric_targets(group)):
+            if any(condition_targets_field(condition, target) for condition in conditions):
+                continue
+            if not numeric_field_mentioned(source_text, target):
+                continue
+            conditions.append({"field": target, "operator": "gt", "values": ["0"]})
+        groups.append({**group, "conditions": conditions})
+    modification["condition_groups"] = groups
+    return {**ir, "modification": modification}
+
+
 def preview_output_requested(text: str) -> bool:
     compact = compact_text(text)
     return any(term in compact for term in PREVIEW_OUTPUT_TERMS)
@@ -494,6 +552,173 @@ def collapse_preview_only_detail_steps(ir: dict[str, Any], user_text: str) -> di
     if len(with_requirements) == 1:
         updated["intent_type"] = with_requirements[0].get("intent_type") or updated.get("intent_type")
     return updated
+
+
+def aggregate_requested(text: str) -> bool:
+    compact = compact_text(text)
+    return any(term in compact for term in AGGREGATE_TERMS)
+
+
+def aggregate_group_by_from_text(text: str) -> list[dict[str, str]]:
+    compact = compact_text(text)
+    group_by: list[dict[str, str]] = []
+    if "날짜별" in compact or "날짜기준" in compact:
+        group_by.append({"field_alias": "날짜", "resolved_column": "날짜"})
+    if "캠페인별" in compact or "캠페인기준" in compact:
+        group_by.append({"field_alias": "캠페인", "resolved_column": "캠페인"})
+    if "디바이스별" in compact or "디바이스기준" in compact or "기기별" in compact or "기기기준" in compact:
+        group_by.append({"field_alias": "디바이스", "resolved_column": "디바이스"})
+    return group_by
+
+
+def aggregate_metrics_from_text(text: str) -> list[dict[str, str]]:
+    compact = compact_text(text)
+    metrics: list[dict[str, str]] = []
+    for field, aliases in NUMERIC_FIELD_ALIASES.items():
+        if not any(compact_text(alias) in compact for alias in aliases):
+            continue
+        if "합계" in compact:
+            metrics.append({"alias": f"{field} 합계", "expression_type": "sum", "source_column": field})
+        if "평균" in compact:
+            metrics.append({"alias": f"{field} 평균", "expression_type": "avg", "source_column": field})
+    return metrics
+
+
+def aggregate_conditions_from_text(text: str) -> list[dict[str, Any]]:
+    conditions: list[dict[str, Any]] = []
+    for field in NUMERIC_FIELD_ALIASES:
+        if numeric_zero_requested(text, field):
+            conditions.append({"field": field, "operator": "eq", "values": ["0"]})
+        elif numeric_presence_requested(text, field):
+            conditions.append({"field": field, "operator": "gt", "values": ["0"]})
+    return conditions
+
+
+def aggregate_clause_already_covered(clause: str, groups: list[dict[str, Any]]) -> bool:
+    expected_group_by = {
+        str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or "")
+        for item in aggregate_group_by_from_text(clause)
+        if isinstance(item, dict)
+    }
+    expected_metrics = {
+        (str(item.get("source_column") or item.get("column") or ""), str(item.get("expression_type") or "").lower())
+        for item in aggregate_metrics_from_text(clause)
+        if isinstance(item, dict)
+    }
+    if not expected_metrics:
+        return False
+    for group in groups:
+        if str(group.get("intent_type") or "").upper() != AGGREGATE_INTENT:
+            continue
+        group_by = {
+            str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or "")
+            for item in group.get("group_by", [])
+            if isinstance(item, dict)
+        }
+        metrics = {
+            (str(item.get("source_column") or item.get("column") or ""), str(item.get("expression_type") or "").lower())
+            for item in group.get("metrics", [])
+            if isinstance(item, dict)
+        }
+        if expected_group_by <= group_by and expected_metrics <= metrics:
+            return True
+    return False
+
+
+def recover_independent_read_only_steps(ir: dict[str, Any], user_text: str) -> dict[str, Any]:
+    modification = dict(ir.get("modification", {}))
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    if len(groups) != 1 or is_mutating_group(groups[0]) or ir.get("active_step_id"):
+        return ir
+    clauses = request_clauses(user_text)
+    recovered: list[dict[str, Any]] = []
+    existing = json.dumps(groups, ensure_ascii=False)
+    for clause in clauses:
+        if not aggregate_requested(clause):
+            continue
+        if aggregate_clause_already_covered(clause, groups):
+            continue
+        metrics = aggregate_metrics_from_text(clause)
+        group_by = aggregate_group_by_from_text(clause)
+        if not metrics or (json.dumps(metrics, ensure_ascii=False) in existing and json.dumps(group_by, ensure_ascii=False) in existing):
+            continue
+        recovered.append(
+            {
+                "group_id": f"step_{len(recovered) + 2}",
+                "intent_type": AGGREGATE_INTENT,
+                "dependency": "independent",
+                "depends_on": [],
+                "conditions": aggregate_conditions_from_text(clause),
+                "actions": [],
+                "group_by": group_by,
+                "metrics": metrics,
+                "derived_column": {},
+                "output_requirements": [],
+            }
+        )
+    if not recovered:
+        return ir
+    first = {**groups[0], "group_id": str(groups[0].get("group_id") or "step_1")}
+    modification["condition_groups"] = [first, *recovered]
+    return {**ir, "modification": modification}
+
+
+def split_mixed_media_aggregate_steps(ir: dict[str, Any], user_text: str) -> dict[str, Any]:
+    tables = media_tables_from_text(user_text)
+    if len(tables) <= 1:
+        return ir
+    modification = dict(ir.get("modification", {}))
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    if len(groups) != 1 or str(groups[0].get("intent_type") or "").upper() != AGGREGATE_INTENT:
+        return ir
+    group = groups[0]
+    split_groups: list[dict[str, Any]] = []
+    for index, table_name in enumerate(tables, start=1):
+        split_groups.append(
+            {
+                **group,
+                "group_id": f"step_{index}",
+                "dependency": "independent",
+                "depends_on": [],
+                "conditions": [{"field": "source_channel", "operator": "in", "values": [f"{table_name}.*"]}],
+            }
+        )
+    modification["condition_groups"] = split_groups
+    return {**ir, "modification": modification}
+
+
+def condition_mentions_media_term(condition: dict[str, Any]) -> bool:
+    values = " ".join(str(value) for value in condition.get("values", []))
+    field = str(condition.get("field") or "")
+    text = f"{field} {values}"
+    return bool(media_tables_from_text(text))
+
+
+def remove_media_scope_conditions(ir: dict[str, Any]) -> dict[str, Any]:
+    selection = dict(ir.get("selection", {}))
+    modification = dict(ir.get("modification", {}))
+    selected_tables = [str(table) for table in selection.get("tables", []) if str(table) in MEDIA_TABLE_TERMS]
+    if not selected_tables:
+        return ir
+    selected_channels = {str(value) for value in selection.get("source_channels", [])}
+    groups: list[dict[str, Any]] = []
+    for group in modification.get("condition_groups", []):
+        if not isinstance(group, dict):
+            continue
+        conditions: list[dict[str, Any]] = []
+        for condition in group.get("conditions", []):
+            if not isinstance(condition, dict):
+                continue
+            field = str(condition.get("field") or "")
+            values = {str(value).split(".", 1)[-1] for value in condition.get("values", [])}
+            if condition_mentions_media_term(condition):
+                continue
+            if field == "source_channel" and selected_channels and values and values <= selected_channels:
+                continue
+            conditions.append(condition)
+        groups.append({**group, "conditions": conditions})
+    modification["condition_groups"] = groups
+    return {**ir, "modification": modification}
 
 
 def text_implies_prior_update_dependency(text: str) -> bool:
@@ -998,8 +1223,12 @@ def parse_ir_with_llm(llm: Any, selection_text: str, modification_text: str, sch
         normalized = force_classified_intent(normalized, classified_intent)
     source_text = f"{selection_text} {modification_text}"
     normalized = coerce_numeric_presence_conditions(normalized, source_text)
+    normalized = ensure_numeric_update_predicates(normalized, source_text)
     normalized = coerce_numeric_action_values(normalized, source_text)
     normalized = collapse_preview_only_detail_steps(normalized, source_text)
+    normalized = split_mixed_media_aggregate_steps(normalized, source_text)
+    normalized = recover_independent_read_only_steps(normalized, source_text)
+    normalized = remove_media_scope_conditions(normalized)
     normalized = infer_sequential_dependencies(normalized, source_text)
     return normalized
 
@@ -1018,9 +1247,10 @@ def parse_ir_request_node(state: ModificationWorkflowState, llm: Any = None) -> 
             modification_text=state["modification_text"],
             schema_summary=state.get("schema_summary", build_schema_summary(state.get("table_columns", {}), state.get("source_channel_values", {}))),
         )
+    source_text = f"{state['selection_text']} {state['modification_text']}"
     ir_structured_json["selection"] = normalize_source_channels_from_text(
         selection=ir_structured_json["selection"],
-        selection_text=f"{state['selection_text']} {state['modification_text']}",
+        selection_text=source_text,
         source_channel_values=state.get("source_channel_values", {}),
         source_channel_mappings=state.get("source_channel_mappings", []),
     )
@@ -1030,10 +1260,14 @@ def parse_ir_request_node(state: ModificationWorkflowState, llm: Any = None) -> 
         table_columns=state.get("table_columns", {}),
     )
     ir_structured_json["selection"] = remove_resolved_modification_terms(ir_structured_json["selection"], ir_structured_json["modification"])
-    source_text = f"{state['selection_text']} {state['modification_text']}"
     ir_structured_json = coerce_numeric_presence_conditions(ir_structured_json, source_text)
+    ir_structured_json = ensure_numeric_update_predicates(ir_structured_json, source_text)
     ir_structured_json = coerce_numeric_action_values(ir_structured_json, source_text)
     ir_structured_json = collapse_preview_only_detail_steps(ir_structured_json, source_text)
+    if not state.get("active_step_id"):
+        ir_structured_json = split_mixed_media_aggregate_steps(ir_structured_json, source_text)
+        ir_structured_json = recover_independent_read_only_steps(ir_structured_json, source_text)
+    ir_structured_json = remove_media_scope_conditions(ir_structured_json)
     ir_structured_json = infer_sequential_dependencies(ir_structured_json, source_text)
     ir_structured_json["selection"]["intent_type"] = ir_structured_json.get("intent_type")
     ir_structured_json["modification"]["intent_type"] = ir_structured_json.get("intent_type")

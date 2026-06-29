@@ -298,7 +298,7 @@ def render_comparison_report(metrics: list[RunMetrics], plot_paths: list[Path], 
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare Gemini and Qwen LangGraph test performance.")
+    parser = argparse.ArgumentParser(description="Run Gemini LangGraph test performance reports.")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--output-dir", type=Path, default=COMPARISON_DIR)
     parser.add_argument(
@@ -331,7 +331,7 @@ def main() -> int:
         return 0
     if not args.allow_external_llm:
         raise SystemExit(
-            "Refusing to run Gemini comparison without --allow-external-llm. "
+            "Refusing to run Gemini reports without --allow-external-llm. "
             "Gemini runs can send live schema metadata and preview context to an external LLM."
         )
     profiles = [
@@ -339,16 +339,6 @@ def main() -> int:
             key="gemini_3_1_flash_lite",
             label="gemini-3.1-flash-lite (native)",
             env={"SQL_WORKFLOW_LLM_PROVIDER": "gemini_native", "SQL_WORKFLOW_GEMINI_MODEL": "gemini-3.1-flash-lite"},
-        ),
-        ModelProfile(
-            key="qwen3_14b_ud_q6_k",
-            label="qwen3-14b UD Q6_K GGUF (llama.cpp)",
-            env={
-                "SQL_WORKFLOW_LLM_PROVIDER": "openai_compatible",
-                "SQL_WORKFLOW_LLM_BASE_URL": "http://127.0.0.1:8000/v1",
-                "SQL_WORKFLOW_LLM_MODEL": "qwen3-14b",
-                "SQL_WORKFLOW_LLM_API_KEY": "EMPTY",
-            },
         ),
     ]
     suites = {"test1": PROJECT_ROOT / "test" / "test.md", "test2": PROJECT_ROOT / "test" / "test2.md"}

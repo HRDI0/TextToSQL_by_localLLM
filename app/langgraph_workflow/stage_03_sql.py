@@ -56,6 +56,14 @@ FIELD_NAME_FALLBACKS = {
 }
 
 
+def first_allowed_table(selection_request: dict[str, Any]) -> str:
+    for table in selection_request.get("tables") or []:
+        table_name = str(table)
+        if table_name in ALLOWED_TABLES:
+            return table_name
+    raise ValueError("selection_requires_allowed_table: expected DA or SA")
+
+
 def is_numeric_literal(value: Any) -> bool:
     try:
         float(str(value).replace(",", ""))
@@ -103,6 +111,7 @@ def effective_table_source_sql(
             return quote_identifier(target_table), [], []
         return quote_identifier(target_table), [], []
 
+    base_columns = set(overlay_context.get("base_columns") or columns)
     linked_plan_id = overlay_context.get("linked_plan_id")
     active_step_order = overlay_context.get("active_step_order")
     overlay_columns = [str(column) for column in overlay_context.get("overlay_columns", []) if str(column) in columns]
@@ -116,7 +125,7 @@ def effective_table_source_sql(
     joins: list[str] = []
     overlay_set = set(overlay_columns)
     for column in columns:
-        raw_column = f"raw.{quote_identifier(column)}"
+        raw_column = f"raw.{quote_identifier(column)}" if column in base_columns else "NULL"
         if column not in overlay_set or column == "row_id":
             select_parts.append(f"{raw_column} AS {quote_identifier(column)}")
             continue
@@ -267,14 +276,15 @@ def build_selection_sql(
     table_columns: dict[str, list[str]],
     source_channel_values: dict[str, list[str]],
 ) -> dict[str, Any]:
-    table_name = selection_request.get("tables", ["SA"])[0]
+    table_name = first_allowed_table(selection_request)
     if table_name not in ALLOWED_TABLES:
         raise ValueError("Only DA and SA are allowed.")
 
     compiled_scope = compile_selection_scope_to_where(selection_request, table_columns, source_channel_values)
     where_sql = compiled_scope.get("sql", "1 = 1")
     params = list(compiled_scope.get("params", []))
-    sql = f"SELECT * FROM {quote_identifier(table_name)} WHERE {where_sql}"
+    order_sql = " ORDER BY `row_id`" if "row_id" in table_columns.get(table_name, []) else ""
+    sql = f"SELECT * FROM {quote_identifier(table_name)} WHERE {where_sql}{order_sql}"
     return {
         "sql_type": "SELECT",
         "sql": sql,
@@ -488,7 +498,7 @@ def compile_conditions_to_where(
     table_columns: dict[str, list[str]],
     column_alias_mappings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    table_name = selection_request.get("tables", ["SA"])[0]
+    table_name = first_allowed_table(selection_request)
     compiled_parts: list[dict[str, Any]] = []
     for group in modification_logic.get("condition_groups", []):
         for condition in group.get("conditions", []):
@@ -596,7 +606,7 @@ def filter_read_only_live_conditions(
     table_columns: dict[str, list[str]],
     column_alias_mappings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    table_name = selection_request.get("tables", ["SA"])[0]
+    table_name = first_allowed_table(selection_request)
     filtered_groups: list[dict[str, Any]] = []
     for group in modification_logic.get("condition_groups", []):
         filtered_conditions: list[dict[str, Any]] = []
@@ -623,7 +633,7 @@ def compile_selection_scope_to_where(
     table_columns: dict[str, list[str]],
     source_channel_values: dict[str, list[str]],
 ) -> dict[str, Any]:
-    table_name = selection_request.get("tables", ["SA"])[0]
+    table_name = first_allowed_table(selection_request)
     where_parts: list[str] = []
     params: list[Any] = []
     columns: list[str] = []
@@ -1230,7 +1240,7 @@ def metric_expression(metric: dict[str, Any], table_columns: list[str]) -> tuple
 
 def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table_columns: dict[str, list[str]]) -> dict[str, Any]:
     selection_request = state["selection_request"]
-    target_table = selection_request.get("tables", ["SA"])[0]
+    target_table = first_allowed_table(selection_request)
     columns = table_columns.get(target_table, [])
     if target_table not in ALLOWED_TABLES or not columns:
         raise ValueError("aggregate_sql_requires_live_target_table")
@@ -1244,12 +1254,20 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
     expected_predicate_required = has_condition_groups(modification_logic)
     text = aggregate_context_text(state, modification_logic)
     column_alias_mappings = state.get("column_alias_mappings", [])
-    group_by_columns = [
+    context = state.get("effective_preview_context", {})
+    overlay_context = context if isinstance(context, dict) else {}
+    derived_overlay_columns = [str(column) for column in overlay_context.get("derived_overlay_columns", []) if str(column)]
+    raw_group_by_columns = [
         resolve_workflow_column(str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or ""), target_table, table_columns, column_alias_mappings)
         for item in modification_logic.get("group_by", [])
         if isinstance(item, dict)
     ] or group_by_columns_from_dictionary(text, target_table, columns, column_alias_mappings)
-    group_by_columns = [column for column in unique_preserve_order(group_by_columns) if column in columns]
+    derived_group_by_columns = [
+        str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or "")
+        for item in modification_logic.get("group_by", [])
+        if isinstance(item, dict) and str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or "") in derived_overlay_columns
+    ]
+    group_by_columns = [column for column in unique_preserve_order([*raw_group_by_columns, *derived_group_by_columns]) if column in columns or column in derived_overlay_columns]
 
     metric_definitions = state.get("metric_definitions", [])
     dictionary_metrics = metric_specs_from_dictionary(text, target_table, columns, metric_definitions)
@@ -1276,13 +1294,12 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         metric_params.extend(expression_params)
 
     where_sql = precompiled_where.get("sql", "1 = 1")
-    context = state.get("effective_preview_context", {})
-    overlay_context = context if isinstance(context, dict) else {}
     should_push_where_to_raw_source = bool(overlay_context.get("overlay_columns")) and where_sql != "1 = 1"
     source_columns = unique_preserve_order(
         [
             *referenced_columns,
             *[str(column) for column in overlay_context.get("overlay_columns", []) if str(column) in columns],
+            *[column for column in group_by_columns if column in derived_overlay_columns],
         ]
     )
     if not source_columns:
@@ -1290,7 +1307,7 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
     source_sql, overlay_params, overlay_columns = effective_table_source_sql(
         target_table,
         source_columns,
-        overlay_context,
+        {**overlay_context, "base_columns": columns},
         where_sql if should_push_where_to_raw_source else "",
         list(precompiled_where.get("params", [])) if should_push_where_to_raw_source else [],
     )
@@ -1298,7 +1315,10 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
     if group_by_columns:
         group_sql = " GROUP BY " + ", ".join(quote_identifier(column) for column in group_by_columns)
     outer_where_sql = "1 = 1" if should_push_where_to_raw_source else where_sql
-    sql = f"SELECT {', '.join(select_parts)} FROM {source_sql} WHERE {outer_where_sql}{group_sql}"
+    order_sql = ""
+    if group_by_columns:
+        order_sql = " ORDER BY " + ", ".join(quote_identifier(column) for column in group_by_columns)
+    sql = f"SELECT {', '.join(select_parts)} FROM {source_sql} WHERE {outer_where_sql}{group_sql}{order_sql}"
     params = [*metric_params, *overlay_params]
     if not should_push_where_to_raw_source:
         params.extend(precompiled_where.get("params", []))
@@ -1308,6 +1328,7 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         "sql": sql,
         "params": params,
         "referenced_columns": unique_preserve_order([*referenced_columns, *overlay_columns]),
+        "virtual_columns": unique_preserve_order(derived_overlay_columns),
         "target_table": target_table,
         "reason": "intent_type=SELECT_AGGREGATE; deterministic code rendered aggregate SELECT from IR, live schema, and linked-step overlay deltas.",
         "actions": [],
@@ -1321,7 +1342,7 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
 
 def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_columns: dict[str, list[str]]) -> dict[str, Any]:
     selection_request = state["selection_request"]
-    target_table = selection_request.get("tables", ["SA"])[0]
+    target_table = first_allowed_table(selection_request)
     columns = table_columns.get(target_table, [])
     if target_table not in ALLOWED_TABLES or not columns:
         raise ValueError("select_detail_requires_live_target_table")
@@ -1333,9 +1354,10 @@ def build_select_detail_sql_candidate(state: ModificationWorkflowState, table_co
     expected_predicate_required = has_condition_groups(state.get("modification_logic", {}))
     where_sql = precompiled_where.get("sql", "1 = 1")
     context = state.get("effective_preview_context", {})
-    source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, context if isinstance(context, dict) else {})
+    source_sql, overlay_params, overlay_columns = effective_table_source_sql(target_table, columns, {**context, "base_columns": columns} if isinstance(context, dict) else {})
     params = [*overlay_params, *precompiled_where.get("params", [])]
-    sql = f"SELECT * FROM {source_sql} WHERE {where_sql}"
+    order_sql = " ORDER BY `row_id`" if "row_id" in columns else ""
+    sql = f"SELECT * FROM {source_sql} WHERE {where_sql}{order_sql}"
     return {
         "source": "deterministic_select_detail_renderer",
         "sql_type": "SELECT",
@@ -1409,7 +1431,7 @@ def infer_derived_column_spec(modification_logic: dict[str, Any], modification_t
 
 def build_derived_value_insert_sql_candidate(state: ModificationWorkflowState, table_columns: dict[str, list[str]]) -> dict[str, Any]:
     selection_request = state["selection_request"]
-    target_table = selection_request.get("tables", ["SA"])[0]
+    target_table = first_allowed_table(selection_request)
     columns = table_columns.get(target_table, [])
     if target_table not in ALLOWED_TABLES or not columns:
         raise ValueError("derived_sql_requires_live_target_table")
@@ -1548,9 +1570,10 @@ def compile_structured_actions_sql_candidate(
 
 def generate_or_reuse_sql_node(state: ModificationWorkflowState, llm: Any = None) -> dict[str, Any]:
     table_columns = state.get("table_columns", {})
-    target_table = state.get("selection_request", {}).get("tables", ["SA"])[0]
+    target_table: str | None = None
     intent_type = str(state.get("ir_structured_json", {}).get("intent_type") or state.get("modification_logic", {}).get("intent_type") or "").upper()
     try:
+        target_table = first_allowed_table(state.get("selection_request", {}))
         if intent_type == ASK_CLARIFICATION_INTENT:
             raise ValueError("intent_requires_clarification_before_sql_generation")
         if intent_type == SELECT_DETAIL_INTENT:
@@ -1647,6 +1670,8 @@ def generate_or_reuse_sql_node(state: ModificationWorkflowState, llm: Any = None
         return {"modification_logic": modification_logic, "precompiled_where": precompiled_where, "sql_candidate": sql_candidate}
     except Exception as exc:
         try:
+            if not target_table:
+                raise ValueError("review_only_fallback_requires_allowed_table")
             sql_candidate = build_review_only_sql_candidate_after_error(state, table_columns, target_table, str(exc))
         except Exception:
             sql_candidate = build_blocked_sql_candidate(str(exc), target_table)
@@ -1762,9 +1787,9 @@ def parse_sql_with_script(sql: str) -> dict[str, Any]:
         stripped,
         flags=re.IGNORECASE,
     )
-    select_match = re.fullmatch(r"SELECT\s+.+\s+FROM\s+`([^`]+)`\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+)?", stripped, flags=re.IGNORECASE)
+    select_match = re.fullmatch(r"SELECT\s+.+\s+FROM\s+`([^`]+)`\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+?)?(?:\s+ORDER\s+BY\s+.+)?", stripped, flags=re.IGNORECASE)
     overlay_select_match = re.fullmatch(
-        r"SELECT\s+.+\s+FROM\s+\(SELECT\s+.+\s+FROM\s+`([^`]+)`(?:\s+AS\s+raw)?(?:\s+LEFT\s+JOIN\s+.+?)?(?:\s+WHERE\s+.+?)?\)\s+AS\s+effective_source\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+)?",
+        r"SELECT\s+.+\s+FROM\s+\(SELECT\s+.+\s+FROM\s+`([^`]+)`(?:\s+AS\s+raw)?(?:\s+LEFT\s+JOIN\s+.+?)?(?:\s+WHERE\s+.+?)?\)\s+AS\s+effective_source\s+WHERE\s+(.+?)(?:\s+GROUP\s+BY\s+.+?)?(?:\s+ORDER\s+BY\s+.+)?",
         stripped,
         flags=re.IGNORECASE,
     )
@@ -1858,8 +1883,9 @@ def validate_sql_with_script(
     declared_columns = set(sql_candidate.get("referenced_columns", []))
     parsed_columns = set(referenced_columns)
     known_columns = set(table_columns.get(table_name, [])) if table_name else set()
+    virtual_columns = {str(column) for column in sql_candidate.get("virtual_columns", []) if str(column)}
     if sql_type == "SELECT":
-        unknown_columns = [column for column in declared_columns if column not in known_columns]
+        unknown_columns = [column for column in declared_columns if column not in known_columns and column not in virtual_columns]
         select_star_allowed = (
             not declared_columns
             and bool(known_columns)

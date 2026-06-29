@@ -223,6 +223,31 @@ def extract_update_where_sql(sql: str) -> str:
     return match.group(2)
 
 
+def update_set_param_count(sql: str) -> int:
+    match = re.fullmatch(r"UPDATE\s+`[^`]+`\s+SET\s+(.+)\s+WHERE\s+.+", sql.strip(), flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        raise ValueError("Preview requires validated UPDATE SQL.")
+    return match.group(1).count("%s")
+
+
+def order_by_row_id_sql(target_table: str, connection: Any | None) -> str:
+    if connection is None:
+        return ""
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS column_count
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = 'row_id'
+                """,
+                (target_table,),
+            )
+            return " ORDER BY `row_id`" if int(cursor.fetchone()["column_count"]) > 0 else ""
+    except Exception:
+        return ""
+
+
 def build_preview_from_candidate(
     connection: Any,
     sql_candidate: dict[str, Any],
@@ -247,22 +272,36 @@ def build_preview_from_candidate(
         where_sql = sql_candidate.get("where_sql") or "1 = 1"
         where_params = list(sql_candidate.get("where_params", []))
         count_sql = f"SELECT COUNT(*) AS affected_row_count FROM {quote_identifier(target_table)} WHERE {where_sql}"
-        select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql} LIMIT %s"
+        order_sql = order_by_row_id_sql(target_table, connection)
+        select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}{order_sql}"
         with connection.cursor() as cursor:
             cursor.execute(query_for_positional_params(count_sql, where_params), tuple(where_params))
             affected_row_count = int(cursor.fetchone()["affected_row_count"])
-            cursor.execute(query_for_positional_params(select_sql, [*where_params, limit]), tuple([*where_params, limit]))
+            cursor.execute(query_for_positional_params(select_sql, where_params), tuple(where_params))
             target_rows = list(cursor.fetchall())
-        preview_rows = [
-            {
-                "row_index": index,
-                "db_row": row,
-                "before": {sql_candidate.get("derived_key"): None},
-                "after": {sql_candidate.get("derived_key"): sql_candidate.get("derived_value")},
+        preview_rows: list[dict[str, Any]] = []
+        delta_items: list[dict[str, Any]] = []
+        derived_key = sql_candidate.get("derived_key")
+        derived_value = sql_candidate.get("derived_value")
+        for index, row in enumerate(target_rows):
+            before = {derived_key: None}
+            after = {derived_key: derived_value}
+            delta_item = {
+                "step_id": sql_candidate.get("active_step_id"),
+                "step_order": sql_candidate.get("active_step_order"),
+                "target_table": target_table,
+                "source_row_id": row.get("row_id"),
+                "source_row_hash": row.get("source_row_hash"),
+                "delta_type": "preview_derived",
+                "before": before,
+                "after": after,
+                "delta": {derived_key: {"old_value": None, "new_value": derived_value}},
+                "status": sql_candidate.get("delta_status", "pending"),
             }
-            for index, row in enumerate(target_rows)
-        ]
-        return preview_rows, affected_row_count, []
+            delta_items.append(delta_item)
+            if len(preview_rows) < limit:
+                preview_rows.append({"row_index": index, "db_row": row, "before": before, "after": after, "delta_item": delta_item})
+        return preview_rows, affected_row_count, delta_items
     if sql_candidate.get("sql_type") != "UPDATE":
         return [], 0, []
     if connection is None:
@@ -273,9 +312,9 @@ def build_preview_from_candidate(
         raise ValueError("Preview requires validated action metadata.")
     target_table = sql_candidate["target_table"]
     where_sql = extract_update_where_sql(sql_candidate["sql"])
-    where_params = list(sql_candidate.get("params", []))[len(actions) :]
+    where_params = list(sql_candidate.get("params", []))[update_set_param_count(sql_candidate["sql"]) :]
     count_sql = f"SELECT COUNT(*) AS affected_row_count FROM {quote_identifier(target_table)} WHERE {where_sql}"
-    select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}"
+    select_sql = f"SELECT * FROM {quote_identifier(target_table)} WHERE {where_sql}{order_by_row_id_sql(target_table, connection)}"
 
     with connection.cursor() as cursor:
         cursor.execute(query_for_positional_params(count_sql, where_params), tuple(where_params))
@@ -330,8 +369,7 @@ def table_exists(connection: Any, table_name: str) -> bool:
 
 
 def update_where_params(sql_candidate: dict[str, Any]) -> list[Any]:
-    actions = sql_candidate.get("actions", [])
-    return list(sql_candidate.get("params", []))[len(actions) :]
+    return list(sql_candidate.get("params", []))[update_set_param_count(sql_candidate["sql"]) :]
 
 
 def rollback_snapshot(connection: Any, sql_candidate: dict[str, Any]) -> dict[str, Any]:
@@ -456,6 +494,7 @@ def build_change_preview_json(
     rendered_sql: str | None = None,
     preview_error: str | None = None,
     preview_delta_items: list[dict[str, Any]] | None = None,
+    evidence_bundle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if validation_result.get("status") != "passed":
         status = "blocked_by_validation"
@@ -477,8 +516,37 @@ def build_change_preview_json(
         "preview_limited": affected_row_count > len(preview_rows),
         "changes": preview_rows,
         "preview_delta_items": preview_delta_items or [],
+        "evidence_bundle": evidence_bundle or {},
         "validation_result": validation_result,
         "preview_error": preview_error,
+    }
+
+
+def build_evidence_bundle(sql_candidate: dict[str, Any], preview_rows: list[dict[str, Any]], preview_delta_items: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
+    action_columns = [str(action.get("target_field")) for action in sql_candidate.get("actions", []) if isinstance(action, dict) and action.get("target_field")]
+    predicate_columns = [str(item.get("column")) for item in sql_candidate.get("predicate", []) if isinstance(item, dict) and item.get("column")]
+    referenced_columns = [str(column) for column in sql_candidate.get("referenced_columns", []) if str(column)]
+    overlay_columns = [str(column) for column in context.get("overlay_columns", []) if str(column)] if isinstance(context, dict) else []
+    changed_columns = [
+        str(column)
+        for item in preview_delta_items
+        if isinstance(item, dict) and isinstance(item.get("after"), dict)
+        for column in item["after"].keys()
+    ]
+    required = []
+    for column in [*referenced_columns, *predicate_columns, *action_columns, *overlay_columns, *changed_columns]:
+        if column and column not in required:
+            required.append(column)
+    return {
+        "required_evidence_columns": required,
+        "query_executed": bool(sql_candidate.get("sql") and preview_rows is not None),
+        "overlay_sources": {
+            "linked_plan_id": context.get("linked_plan_id") if isinstance(context, dict) else None,
+            "overlay_step_keys": context.get("overlay_step_keys", []) if isinstance(context, dict) else [],
+            "overlay_columns": overlay_columns,
+            "derived_overlay_columns": context.get("derived_overlay_columns", []) if isinstance(context, dict) else [],
+        },
+        "proof_row_count": len(preview_rows),
     }
 
 
@@ -512,6 +580,8 @@ def build_change_preview_json_node(state: ModificationWorkflowState, connection:
         affected_row_count = 0
         preview_error = str(exc)
     sample_delta_items = [row["delta_item"] for row in preview_rows if isinstance(row.get("delta_item"), dict)]
+    context = state.get("effective_preview_context", {})
+    evidence_bundle = build_evidence_bundle(state["sql_candidate"], preview_rows, preview_delta_items, context if isinstance(context, dict) else {})
     change_preview_json = build_change_preview_json(
         state["sql_candidate"],
         validation_result,
@@ -520,8 +590,8 @@ def build_change_preview_json_node(state: ModificationWorkflowState, connection:
         rendered_sql,
         preview_error,
         sample_delta_items,
+        evidence_bundle,
     )
-    context = state.get("effective_preview_context", {})
     if preview_error is None and isinstance(context, dict):
         persist_preview_delta_items(
             connection,
@@ -548,6 +618,7 @@ def build_change_preview_json_node(state: ModificationWorkflowState, connection:
         "preview_rows": preview_rows,
         "preview_delta_items": sample_delta_items,
         "linked_step_results": linked_step_results,
+        "evidence_bundle": evidence_bundle,
         "change_preview_json": change_preview_json,
     }
 
@@ -726,6 +797,7 @@ def build_query_from_ir(state: ModificationWorkflowState) -> dict[str, Any]:
         "sql_fingerprint": sql_candidate.get("sql_fingerprint"),
         "validation_result": state.get("validation_result", {}),
         "reason": sql_candidate.get("reason"),
+        "evidence_bundle": state.get("evidence_bundle") or change_preview_json.get("evidence_bundle", {}),
     }
 
 
@@ -756,16 +828,20 @@ def flatten_value(prefix: str, value: Any, output: dict[str, Any]) -> None:
 
 def preview_row_to_sample_row(row: dict[str, Any]) -> dict[str, Any]:
     output: dict[str, Any] = {"row_index": row.get("row_index")}
-    db_row = row.get("db_row")
-    if isinstance(db_row, dict):
-        for key, value in db_row.items():
-            output[str(key)] = value
-    elif isinstance(row.get("result"), dict):
-        for key, value in row["result"].items():
-            output[str(key)] = value
     for key in ["before", "after"]:
         if isinstance(row.get(key), dict):
             flatten_value(key, row[key], output)
+    db_row = row.get("db_row")
+    if isinstance(db_row, dict):
+        for key, value in db_row.items():
+            if str(key) in output:
+                continue
+            output[str(key)] = value
+    elif isinstance(row.get("result"), dict):
+        for key, value in row["result"].items():
+            if str(key) in output:
+                continue
+            output[str(key)] = value
     return output
 
 
@@ -780,6 +856,11 @@ def is_empty_sample_value(value: Any) -> bool:
     return isinstance(value, str) and value.strip() == ""
 
 
+def is_aggregate_sample_column(column: str) -> bool:
+    normalized = re.sub(r"[\s_\-.]+", "", column).lower()
+    return any(marker in normalized for marker in ["합계", "평균", "클릭률", "전환율", "sum", "avg", "average", "rate"])
+
+
 def filter_sample_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not rows:
         return []
@@ -792,7 +873,11 @@ def filter_sample_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     visible_columns = [
         column
         for column in columns
-        if column == "row_index" or (not is_hidden_sample_column(column) and not all(is_empty_sample_value(row.get(column)) for row in rows))
+        if column == "row_index"
+        or (
+            not is_hidden_sample_column(column)
+            and (is_aggregate_sample_column(column) or not all(is_empty_sample_value(row.get(column)) for row in rows))
+        )
     ]
     return [{column: row.get(column) for column in visible_columns if column in row} for row in rows]
 
@@ -806,8 +891,11 @@ def build_final_output_json(state: ModificationWorkflowState) -> dict[str, Any]:
         "workflow_steps": state.get("workflow_steps", []),
         "linked_step_plan": state.get("linked_step_plan", []),
         "linked_step_validation": state.get("linked_step_validation", {}),
+        "request_scope": state.get("request_scope", {}),
+        "request_fingerprint": state.get("request_fingerprint"),
         "preview_delta_items": state.get("preview_delta_items", []),
         "effective_preview_context": state.get("effective_preview_context", {}),
+        "evidence_bundle": state.get("evidence_bundle", {}),
         "linked_step_results": state.get("linked_step_results", []),
         "query_recommendations": state.get("query_recommendations", []),
         "resolution_candidates": state.get("resolution_candidates", []),
