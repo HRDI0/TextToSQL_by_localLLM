@@ -48,10 +48,9 @@ flowchart LR
 ├── migrations/
 ├── docs/public/
 ├── .env.example
-├── compose.example.yaml
+├── compose.yaml
 ├── requirements.txt
-├── requirements-langgraph.txt
-└── requirements-mariadb.txt
+└── requirements.txt
 ```
 
 `docs/public/`는 GitHub 공개 가능 문서 영역이다. 내부 설계 문서, migration 상세 운영값, raw data, DB backup, local model file, runtime log, `.env`, 로컬 compose 파일은 공개 artifact가 아니다.

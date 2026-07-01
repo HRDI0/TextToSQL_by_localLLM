@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
+from dotenv import load_dotenv  # type: ignore[reportMissingImports]
 import pymysql  # type: ignore[import-not-found]
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 def env_value(name: str, default: str) -> str:

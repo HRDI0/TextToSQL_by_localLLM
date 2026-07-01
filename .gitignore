@@ -18,6 +18,7 @@ ENV/
 .pyright/
 .coverage
 htmlcov/
+llama.cpp
 
 # Streamlit and local app state
 .streamlit/
@@ -34,9 +35,11 @@ temp/
 .cache/
 test/
 
-# Local Docker Compose configuration
-compose.yaml
-compose.yml
+# Docker Compose configuration
+compose.override.yaml
+compose.override.yml
+!compose.yaml
+!compose.yml
 !compose.example.yaml
 !compose.example.yml
 
@@ -52,15 +55,11 @@ docs/**
 !docs/
 !docs/public/
 !docs/public/**
-# Internal database schema and migration files
-migrations/
-!migrations/
-!migrations/005_linked_step_plan.sql
+# Versioned database schema and migration files
+!migrations/**
 
 # Raw data, archives, and generated local assets
-data/raw*/
-data/private/
-data/internal/
+data/
 *.zip
 *.7z
 *.tar

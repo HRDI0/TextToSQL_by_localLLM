@@ -125,6 +125,15 @@ def extract_zero_update_set_columns(sql: str) -> list[str]:
     return columns
 
 
+def extract_select_alias_columns(sql: str) -> list[str]:
+    if _find_keyword_outside_quotes(sql, "SELECT") < 0:
+        return []
+    columns: list[str] = []
+    for match in re.finditer(r"\bAS\s+`([^`]+)`", sql, flags=re.IGNORECASE):
+        columns.append(match.group(1))
+    return unique_preserve_order(columns)
+
+
 MEDIA_TABLES = {"검색광고": "SA", "디스플레이 광고": "DA", "디스플레이": "DA"}
 METRIC_COLUMNS = {"클릭": "클릭수", "노출": "노출수", "비용": "비용"}
 DIMENSION_COLUMNS = {"날짜": "날짜", "캠페인": "캠페인", "기기": "디바이스", "디바이스": "디바이스", "광고 그룹": "광고 그룹"}
@@ -178,7 +187,9 @@ def media_segments(request_text: str) -> list[dict[str, str]]:
 
 def summary_columns(summary: dict[str, Any]) -> list[str]:
     columns: list[str] = []
-    columns.extend(extract_update_set_columns(str(summary.get("sql") or "")))
+    sql = str(summary.get("sql") or "")
+    columns.extend(extract_update_set_columns(sql))
+    columns.extend(extract_select_alias_columns(sql))
     columns.extend(str(item.get("column")) for item in summary.get("predicate", []) if isinstance(item, dict) and item.get("column"))
     columns.extend(str(item) for item in summary.get("referenced_columns", []) if item)
     for row in summary.get("sample_rows", []):
@@ -188,7 +199,9 @@ def summary_columns(summary: dict[str, Any]) -> list[str]:
 
 def summary_signal_columns(summary: dict[str, Any]) -> list[str]:
     columns: list[str] = []
-    columns.extend(extract_update_set_columns(str(summary.get("sql") or "")))
+    sql = str(summary.get("sql") or "")
+    columns.extend(extract_update_set_columns(sql))
+    columns.extend(extract_select_alias_columns(sql))
     columns.extend(str(item.get("column")) for item in summary.get("predicate", []) if isinstance(item, dict) and item.get("column"))
     columns.extend(str(item) for item in summary.get("referenced_columns", []) if item)
     if str(summary.get("sql_type") or "").upper() == "SELECT" and any(str(key).endswith(("합계", "평균")) for row in summary.get("sample_rows", []) for key in row.keys()):
@@ -347,6 +360,20 @@ def expected_metric_columns(text: str) -> list[str]:
     return unique_preserve_order(expected)
 
 
+def semantic_column_present(expected_column: str, columns: list[str]) -> bool:
+    if expected_column in columns:
+        return True
+    expected_token = compact_text(expected_column)
+    metric_tokens = [token for token, column in METRIC_COLUMNS.items() if column == expected_column]
+    for column in columns:
+        column_token = compact_text(column)
+        if expected_token and expected_token in column_token:
+            return True
+        if any(compact_text(token) in column_token for token in metric_tokens):
+            return True
+    return False
+
+
 def expected_row_conditions(text: str) -> list[dict[str, str]]:
     compact = compact_text(text)
     conditions: list[dict[str, str]] = []
@@ -462,10 +489,10 @@ def semantic_alignment_errors(case_number: str, request_text: str, summary: dict
         aggregate_text = compact_text(segment)
         if any(token in aggregate_text for token in ["합계", "평균", "클릭률", "계산"]):
             for column in expected_group_columns(segment):
-                if column not in columns:
+                if not semantic_column_present(column, columns):
                     errors.append(f"semantic_group_column_missing: {column}")
             for column in expected_metric_columns(segment):
-                if column not in columns:
+                if not semantic_column_present(column, columns):
                     errors.append(f"semantic_metric_column_missing: {column}")
         else:
             errors.extend(sample_rows_match_expected_conditions(sample_rows, expected_row_conditions(segment), predicate_columns or None))

@@ -61,8 +61,8 @@ def build_modification_workflow_graph(llm: Any = None, connection: Any = None, d
 
 def build_demo_state(approved: bool = False, stored_rules: list[dict[str, Any]] | None = None) -> ModificationWorkflowState:
     return {
-        "selection_text": "5월 검색광고 원본 데이터만 조회해줘.",
-        "modification_text": "매체명이 '검색매체A'이고 캠페인명이 'campaign_alpha' 또는 'campaign_beta'라면 광고상품 컬럼은 '검색광고 상품'으로 기입한다.",
+        "selection_text": "",
+        "modification_text": "",
         "stored_rules": stored_rules or [],
         "user_confirmation": {"approved": approved},
         "errors": [],

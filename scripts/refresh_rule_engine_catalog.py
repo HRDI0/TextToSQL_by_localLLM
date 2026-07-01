@@ -6,9 +6,14 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv  # type: ignore[reportMissingImports]
 import pymysql  # type: ignore[import-not-found]
+
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 ALLOWED_TABLES = ("DA", "SA")
@@ -191,11 +196,11 @@ def refresh_catalog(config: DbConfig, per_column_limit: int) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Refresh rule-engine column/value recommendation catalogs from DA/SA tables.")
-    parser.add_argument("--host", default=env_value("SQL_WORKFLOW_DB_HOST", "127.0.0.1", "KTM_DB_HOST"))
-    parser.add_argument("--port", type=int, default=int(env_value("SQL_WORKFLOW_DB_PORT", "3307", "KTM_DB_PORT")))
-    parser.add_argument("--user", default=env_value("SQL_WORKFLOW_DB_USER", "workflow_user", "KTM_DB_USER"))
-    parser.add_argument("--password", default=env_value("SQL_WORKFLOW_DB_PASSWORD", "", "KTM_DB_PASSWORD"))
-    parser.add_argument("--database", default=env_value("SQL_WORKFLOW_DB_NAME", "approval_workflow", "KTM_DB_NAME"))
+    parser.add_argument("--host", default=env_value("SQL_WORKFLOW_DB_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(env_value("SQL_WORKFLOW_DB_PORT", "3307")))
+    parser.add_argument("--user", default=env_value("SQL_WORKFLOW_DB_USER", "workflow_user"))
+    parser.add_argument("--password", default=env_value("SQL_WORKFLOW_DB_PASSWORD", ""))
+    parser.add_argument("--database", default=env_value("SQL_WORKFLOW_DB_NAME", "approval_workflow"))
     parser.add_argument("--per-column-limit", type=int, default=50)
     return parser
 

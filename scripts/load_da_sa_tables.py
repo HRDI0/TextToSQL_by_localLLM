@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from dotenv import load_dotenv  # type: ignore[reportMissingImports]
 import pymysql  # type: ignore[import-not-found]
 
 from import_raw_data import choose_header_row, non_empty_cells, read_tables, row_payload, table_headers
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 def env_value(name: str, default: str) -> str:

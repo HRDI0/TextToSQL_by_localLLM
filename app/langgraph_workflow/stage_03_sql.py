@@ -1257,6 +1257,51 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
     context = state.get("effective_preview_context", {})
     overlay_context = context if isinstance(context, dict) else {}
     derived_overlay_columns = [str(column) for column in overlay_context.get("derived_overlay_columns", []) if str(column)]
+    derived_scope = next(
+        (
+            item
+            for item in overlay_context.get("derived_scope_predicates", [])
+            if isinstance(item, dict) and item.get("target_table") == target_table and item.get("where_sql") and item.get("where_sql") != "1 = 1"
+        ),
+        None,
+    )
+    if derived_scope:
+        precompiled_where = combine_where_predicates(
+            precompiled_where,
+            {
+                "sql": str(derived_scope.get("where_sql")),
+                "params": list(derived_scope.get("where_params", [])),
+                "columns": list(derived_scope.get("columns", [])),
+                "predicate": list(derived_scope.get("predicate", [])),
+            },
+        )
+    elif derived_overlay_columns and overlay_context.get("linked_plan_id") and overlay_context.get("active_step_order") and overlay_context.get("overlay_step_keys") and "row_id" in columns:
+        step_keys = [str(step_key) for step_key in overlay_context.get("overlay_step_keys", []) if str(step_key)]
+        if step_keys:
+            path_checks = " OR ".join(["JSON_CONTAINS_PATH(di.after_json, 'one', %s)" for _ in derived_overlay_columns])
+            step_placeholders = ", ".join(["%s"] * len(step_keys))
+            derived_delta_scope = {
+                "sql": (
+                    f"{quote_identifier('row_id')} IN ("
+                    "SELECT di.source_row_id FROM rule_engine_delta_item di "
+                    "WHERE di.linked_plan_id = %s AND di.target_table = %s "
+                    f"AND di.step_key IN ({step_placeholders}) "
+                    "AND di.delta_status = 'approved' "
+                    "AND (di.expires_at IS NULL OR di.expires_at > NOW()) AND di.step_order < %s "
+                    f"AND ({path_checks})"
+                    ")"
+                ),
+                "params": [
+                    overlay_context.get("linked_plan_id"),
+                    target_table,
+                    *step_keys,
+                    overlay_context.get("active_step_order"),
+                    *[json_path_for_column(column) for column in derived_overlay_columns],
+                ],
+                "columns": ["row_id"],
+                "predicate": [{"column": "row_id", "operator": "in_prior_derived_delta", "values": step_keys}],
+            }
+            precompiled_where = combine_where_predicates(precompiled_where, derived_delta_scope)
     raw_group_by_columns = [
         resolve_workflow_column(str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or ""), target_table, table_columns, column_alias_mappings)
         for item in modification_logic.get("group_by", [])
@@ -1294,11 +1339,13 @@ def build_select_aggregate_sql_candidate(state: ModificationWorkflowState, table
         metric_params.extend(expression_params)
 
     where_sql = precompiled_where.get("sql", "1 = 1")
-    should_push_where_to_raw_source = bool(overlay_context.get("overlay_columns")) and where_sql != "1 = 1"
+    raw_overlay_columns = [str(column) for column in overlay_context.get("overlay_columns", []) if str(column) in columns]
+    should_push_where_to_raw_source = bool(raw_overlay_columns) and where_sql != "1 = 1"
     source_columns = unique_preserve_order(
         [
             *referenced_columns,
-            *[str(column) for column in overlay_context.get("overlay_columns", []) if str(column) in columns],
+            *(["row_id"] if derived_overlay_columns else []),
+            *raw_overlay_columns,
             *[column for column in group_by_columns if column in derived_overlay_columns],
         ]
     )

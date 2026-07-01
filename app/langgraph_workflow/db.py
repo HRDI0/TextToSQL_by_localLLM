@@ -23,11 +23,11 @@ from app.langgraph_workflow.state import (
 
 def db_config_from_env() -> DbConfig:
     return DbConfig(
-        host=os.environ.get("SQL_WORKFLOW_DB_HOST") or os.environ.get("KTM_DB_HOST") or DEFAULT_DB_HOST,
-        port=int(os.environ.get("SQL_WORKFLOW_DB_PORT") or os.environ.get("KTM_DB_PORT") or str(DEFAULT_DB_PORT)),
-        user=os.environ.get("SQL_WORKFLOW_DB_USER") or os.environ.get("KTM_DB_USER") or DEFAULT_DB_USER,
-        password=os.environ.get("SQL_WORKFLOW_DB_PASSWORD") or os.environ.get("KTM_DB_PASSWORD") or DEFAULT_DB_PASSWORD,
-        database=os.environ.get("SQL_WORKFLOW_DB_NAME") or os.environ.get("KTM_DB_NAME") or DEFAULT_DB_NAME,
+        host=os.environ.get("SQL_WORKFLOW_DB_HOST") or DEFAULT_DB_HOST,
+        port=int(os.environ.get("SQL_WORKFLOW_DB_PORT") or str(DEFAULT_DB_PORT)),
+        user=os.environ.get("SQL_WORKFLOW_DB_USER") or DEFAULT_DB_USER,
+        password=os.environ.get("SQL_WORKFLOW_DB_PASSWORD") or DEFAULT_DB_PASSWORD,
+        database=os.environ.get("SQL_WORKFLOW_DB_NAME") or DEFAULT_DB_NAME,
     )
 
 

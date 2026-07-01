@@ -68,7 +68,6 @@ def build_ir_prompt(selection_text: str, modification_text: str, schema_summary:
 /no_think
 너는 자연어 조회 조건과 수정/계산 조건을 실행 가능한 범용 IR JSON으로 구조화한다.
 추론 과정, 설명, markdown 없이 JSON 객체만 출력한다.
-현재 고객사는 환경별 기본 고객사만 있다.
 schema에 없는 table, column, source_channel을 임의로 만들지 않는다.
 이 단계에서는 SQL을 만들지 않는다.
 사용자는 컬럼명을 모른다. 업무 용어는 live schema와 아래 규칙으로 매핑하되, 확신이 없으면 unresolved_terms에 남긴다.
@@ -377,7 +376,7 @@ def infer_media_table_from_text(text: str) -> str | None:
 
 
 def request_clauses(text: str) -> list[str]:
-    clauses = [item.strip() for item in re.split(r"\n+|,|(?:\s*그리고\s*)|(?:\s*별도로\s*)|(?<=[.!?])\s+", text) if item.strip()]
+    clauses = [item.strip() for item in re.split(r"\n+|,|(?:\s*그리고\s*)|(?:\s*이어서\s*)|(?:\s*별도로\s*)|(?:\s*하고\s*)|(?<=[.!?])\s+", text) if item.strip()]
     return clauses or [text]
 
 
@@ -559,6 +558,11 @@ def aggregate_requested(text: str) -> bool:
     return any(term in compact for term in AGGREGATE_TERMS)
 
 
+def update_requested(text: str) -> bool:
+    compact = compact_text(text)
+    return any(term in compact for term in ["0으로", "보정", "채워", "바꿔", "고정", "맞춰", "조정", "수정", "변경"])
+
+
 def aggregate_group_by_from_text(text: str) -> list[dict[str, str]]:
     compact = compact_text(text)
     group_by: list[dict[str, str]] = []
@@ -663,26 +667,273 @@ def recover_independent_read_only_steps(ir: dict[str, Any], user_text: str) -> d
     return {**ir, "modification": modification}
 
 
+def mutating_group_target_fields(group: dict[str, Any]) -> list[str]:
+    targets: list[str] = []
+    for action in group.get("actions", []):
+        if not isinstance(action, dict):
+            continue
+        target = canonical_numeric_field(action.get("target_field") or action.get("target_column"))
+        if target:
+            targets.append(target)
+    derived = group.get("derived_column", {})
+    if isinstance(derived, dict):
+        for value in derived.values():
+            target = canonical_numeric_field(value)
+            if target:
+                targets.append(target)
+    return unique_preserve_order(targets)
+
+
+def split_action_metric_groups(ir: dict[str, Any], user_text: str) -> dict[str, Any]:
+    modification = dict(ir.get("modification", {}))
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    changed = False
+    split_groups: list[dict[str, Any]] = []
+    for group in groups:
+        actions = [item for item in group.get("actions", []) if isinstance(item, dict)]
+        metrics = [item for item in group.get("metrics", []) if isinstance(item, dict)]
+        group_by = [item for item in group.get("group_by", []) if isinstance(item, dict)]
+        has_derived = bool(group.get("derived_column"))
+        if not metrics or (not actions and not has_derived):
+            split_groups.append(group)
+            continue
+        base_id = str(group.get("group_id") or f"step_{len(split_groups) + 1}")
+        mutating_intent = ADD_DERIVED_COLUMN_INTENT if has_derived else UPDATE_INTENT
+        update_group = {
+            **group,
+            "group_id": base_id,
+            "intent_type": mutating_intent,
+            "actions": actions,
+            "metrics": [],
+            "group_by": [],
+        }
+        aggregate_group = {
+            **group,
+            "group_id": f"{base_id}_aggregate",
+            "intent_type": AGGREGATE_INTENT,
+            "actions": [],
+            "derived_column": {},
+            "metrics": metrics,
+            "group_by": group_by,
+            "dependency": "dependent" if text_implies_prior_update_dependency(user_text) else group.get("dependency", "dependent"),
+            "depends_on": [base_id],
+            "output_requirements": [],
+        }
+        split_groups.extend([update_group, aggregate_group])
+        changed = True
+    if not changed:
+        return ir
+    modification["condition_groups"] = split_groups
+    return {**ir, "intent_type": "MULTI_STEP", "modification": modification}
+
+
+def recover_followup_aggregate_steps(ir: dict[str, Any], user_text: str) -> dict[str, Any]:
+    if not aggregate_requested(user_text):
+        return ir
+    modification = dict(ir.get("modification", {}))
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    if not groups:
+        return ir
+    recovered: list[dict[str, Any]] = []
+    last_mutating_id = ""
+    for index, group in enumerate(groups):
+        group_id = str(group.get("group_id") or f"step_{index + 1}")
+        recovered.append({**group, "group_id": group_id})
+        if is_mutating_group(group):
+            last_mutating_id = group_id
+    existing = json.dumps(recovered, ensure_ascii=False)
+    additions: list[dict[str, Any]] = []
+    for clause in request_clauses(user_text):
+        if not aggregate_requested(clause) or aggregate_clause_already_covered(clause, recovered + additions):
+            continue
+        metrics = aggregate_metrics_from_text(clause)
+        if not metrics:
+            continue
+        group_by = aggregate_group_by_from_text(clause)
+        if json.dumps(metrics, ensure_ascii=False) in existing and json.dumps(group_by, ensure_ascii=False) in existing:
+            continue
+        metric_sources = {
+            str(metric.get("source_column") or metric.get("column") or "")
+            for metric in metrics
+            if isinstance(metric, dict)
+        }
+        matching_mutating_id = next(
+            (
+                str(group.get("group_id") or "")
+                for group in reversed(recovered)
+                if is_mutating_group(group)
+                and metric_sources
+                and metric_sources & set(mutating_group_target_fields(group))
+            ),
+            "",
+        )
+        dependency_target = matching_mutating_id or last_mutating_id
+        depends_on = [dependency_target] if dependency_target and text_implies_prior_update_dependency(user_text) else []
+        additions.append(
+            {
+                "group_id": f"step_{len(recovered) + len(additions) + 1}",
+                "intent_type": AGGREGATE_INTENT,
+                "dependency": "dependent" if depends_on else "independent",
+                "depends_on": depends_on,
+                "conditions": aggregate_conditions_from_text(clause),
+                "actions": [],
+                "group_by": group_by,
+                "metrics": metrics,
+                "derived_column": {},
+                "output_requirements": [],
+            }
+        )
+    if not additions:
+        return ir
+    modification["condition_groups"] = [*recovered, *additions]
+    return {**ir, "intent_type": "MULTI_STEP", "modification": modification}
+
+
+def aggregate_group_signature(group: dict[str, Any]) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    group_by = tuple(
+        sorted(
+            str(item.get("resolved_column") or item.get("field") or item.get("field_alias") or "")
+            for item in group.get("group_by", [])
+            if isinstance(item, dict)
+        )
+    )
+    metrics = tuple(
+        sorted(
+            (
+                str(item.get("source_column") or item.get("column") or ""),
+                str(item.get("expression_type") or "").lower(),
+            )
+            for item in group.get("metrics", [])
+            if isinstance(item, dict)
+        )
+    )
+    return group_by, metrics
+
+
+def prune_unscoped_duplicate_aggregate_steps(ir: dict[str, Any]) -> dict[str, Any]:
+    modification = dict(ir.get("modification", {}))
+    groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
+    scoped_signatures = {
+        aggregate_group_signature(group)
+        for group in groups
+        if str(group.get("intent_type") or "").upper() == AGGREGATE_INTENT
+        and aggregate_group_signature(group)[1]
+        and group.get("conditions")
+    }
+    if not scoped_signatures:
+        return ir
+    pruned: list[dict[str, Any]] = []
+    changed = False
+    for group in groups:
+        if (
+            str(group.get("intent_type") or "").upper() == AGGREGATE_INTENT
+            and not group.get("conditions")
+            and aggregate_group_signature(group) in scoped_signatures
+        ):
+            changed = True
+            continue
+        pruned.append(group)
+    if not changed:
+        return ir
+    modification["condition_groups"] = pruned
+    return {**ir, "modification": modification}
+
+
+def media_segments_for_text(text: str) -> list[dict[str, str]]:
+    matches: list[tuple[int, str, str]] = []
+    for table_name, terms in MEDIA_TABLE_TERMS.items():
+        for term in terms:
+            for match in re.finditer(re.escape(term), text):
+                matches.append((match.start(), term, table_name))
+    matches.sort(key=lambda item: item[0])
+    segments: list[dict[str, str]] = []
+    for index, (start, marker, table_name) in enumerate(matches):
+        end = matches[index + 1][0] if index + 1 < len(matches) else len(text)
+        segment_text = text[start:end]
+        if segments and segments[-1]["table"] == table_name and segments[-1]["text"] == segment_text:
+            continue
+        segments.append({"table": table_name, "marker": marker, "text": segment_text})
+    return segments
+
+
+def metric_tokens_for_group(group: dict[str, Any]) -> list[str]:
+    tokens: list[str] = []
+    metric_map = {"클릭수": "클릭", "노출수": "노출", "비용": "비용", "세션수": "세션"}
+    for source in [group.get("conditions", []), group.get("actions", []), group.get("metrics", []), group.get("group_by", [])]:
+        if not isinstance(source, list):
+            continue
+        raw = json.dumps(source, ensure_ascii=False)
+        tokens.extend(token for column, token in metric_map.items() if column in raw or token in raw)
+    return unique_preserve_order(tokens)
+
+
+def matching_media_tables_for_aggregate(group: dict[str, Any], user_text: str, tables: list[str]) -> list[str]:
+    segments = media_segments_for_text(user_text)
+    if not segments:
+        return []
+    tokens = metric_tokens_for_group(group)
+    if not tokens:
+        return []
+    scores: dict[str, int] = {table_name: 0 for table_name in tables}
+    for segment in segments:
+        table_name = segment["table"]
+        if table_name not in scores:
+            continue
+        segment_text = compact_text(segment["text"])
+        for token in tokens:
+            if compact_text(token) in segment_text:
+                scores[table_name] += 1
+    best_score = max(scores.values()) if scores else 0
+    if best_score <= 0:
+        return []
+    return [table_name for table_name, score in scores.items() if score == best_score]
+
+
+def with_media_scope_condition(group: dict[str, Any], table_name: str) -> dict[str, Any]:
+    conditions = [condition for condition in group.get("conditions", []) if isinstance(condition, dict)]
+    scope_condition = {"field": "source_channel", "operator": "in", "values": [f"{table_name}.*"]}
+    if not any(condition == scope_condition for condition in conditions):
+        conditions.append(scope_condition)
+    return {**group, "conditions": conditions}
+
+
 def split_mixed_media_aggregate_steps(ir: dict[str, Any], user_text: str) -> dict[str, Any]:
     tables = media_tables_from_text(user_text)
     if len(tables) <= 1:
         return ir
     modification = dict(ir.get("modification", {}))
     groups = [group for group in modification.get("condition_groups", []) if isinstance(group, dict)]
-    if len(groups) != 1 or str(groups[0].get("intent_type") or "").upper() != AGGREGATE_INTENT:
+    if not groups:
         return ir
-    group = groups[0]
     split_groups: list[dict[str, Any]] = []
-    for index, table_name in enumerate(tables, start=1):
-        split_groups.append(
-            {
-                **group,
-                "group_id": f"step_{index}",
-                "dependency": "independent",
-                "depends_on": [],
-                "conditions": [{"field": "source_channel", "operator": "in", "values": [f"{table_name}.*"]}],
-            }
-        )
+    changed = False
+    for group in groups:
+        if str(group.get("intent_type") or "").upper() != AGGREGATE_INTENT:
+            split_groups.append(group)
+            continue
+        if group.get("conditions"):
+            split_groups.append(group)
+            continue
+        matching_tables = matching_media_tables_for_aggregate(group, user_text, tables)
+        if len(matching_tables) == 1:
+            split_groups.append(with_media_scope_condition(group, matching_tables[0]))
+            changed = True
+            continue
+        if len(groups) == 1:
+            for index, table_name in enumerate(tables, start=1):
+                split_groups.append(
+                    {
+                        **with_media_scope_condition(group, table_name),
+                        "group_id": f"step_{index}",
+                        "dependency": "independent",
+                        "depends_on": [],
+                    }
+                )
+            changed = True
+            continue
+        split_groups.append(group)
+    if not changed:
+        return ir
     modification["condition_groups"] = split_groups
     return {**ir, "modification": modification}
 
@@ -732,10 +983,14 @@ def text_implies_prior_update_dependency(text: str) -> bool:
         "적용후",
         "그결과",
         "그값",
+        "그대상",
         "수정결과",
         "보정결과",
         "이후",
         "다음",
+        "고정하고",
+        "보정하고",
+        "바꾸고",
     )
     return any(term in compact for term in dependency_terms)
 
@@ -769,12 +1024,12 @@ def infer_sequential_dependencies(ir: dict[str, Any], user_text: str) -> dict[st
 
 def classify_intent(selection_text: str, modification_text: str) -> str:
     text = f"{selection_text} {modification_text}".lower()
-    if any(keyword in text for keyword in ["합계", "평균", "건수", "몇 건", "몇건", "row 수", "행 수", "전환율", "전환당", "클릭률", "비교", "계산", "count", "ctr", "cpc", "cpa"]):
-        return AGGREGATE_INTENT
     if any(keyword in text for keyword in ["새 컬럼", "새 구분", "새 항목", "만들", "기입", "분류값", "구분값", "상태값", "상태 값", "임시 상태", "붙", "값으로 분류"]):
         return ADD_DERIVED_COLUMN_INTENT
-    if any(keyword in text for keyword in ["0으로", "보정", "채워", "바꿔", "고정", "preview", "미리보기", "승인"]):
+    if update_requested(text):
         return UPDATE_INTENT
+    if any(keyword in text for keyword in ["합계", "평균", "건수", "몇 건", "몇건", "row 수", "행 수", "전환율", "전환당", "클릭률", "비교", "계산", "count", "ctr", "cpc", "cpa"]):
+        return AGGREGATE_INTENT
     if any(keyword in text for keyword in ["보고", "조회", "확인", "보여", "목록", "샘플", "데이터"]):
         return SELECT_DETAIL_INTENT
     return ASK_CLARIFICATION_INTENT
@@ -789,10 +1044,10 @@ def force_classified_intent(ir: dict[str, Any], intent_type: str) -> dict[str, A
             group_intent = str(group.get("intent_type") or "").upper()
             if group.get("derived_column"):
                 group_intent = ADD_DERIVED_COLUMN_INTENT
-            elif group.get("metrics") or group.get("group_by"):
-                group_intent = AGGREGATE_INTENT
             elif group.get("actions"):
                 group_intent = UPDATE_INTENT
+            elif group.get("metrics") or group.get("group_by"):
+                group_intent = AGGREGATE_INTENT
             elif not group_intent or group_intent == ASK_CLARIFICATION_INTENT:
                 group_intent = intent_type
             groups.append({**group, "intent_type": group_intent})
@@ -823,12 +1078,12 @@ def normalize_ir_structured_json(parsed: dict[str, Any]) -> dict[str, Any]:
         if group.get("derived_column") and group_intent == UPDATE_INTENT:
             group_intent = ADD_DERIVED_COLUMN_INTENT
         if not group_intent:
-            if group.get("metrics") or group.get("group_by"):
-                group_intent = AGGREGATE_INTENT
-            elif group.get("derived_column"):
+            if group.get("derived_column"):
                 group_intent = ADD_DERIVED_COLUMN_INTENT
             elif actions:
                 group_intent = UPDATE_INTENT
+            elif group.get("metrics") or group.get("group_by"):
+                group_intent = AGGREGATE_INTENT
             else:
                 group_intent = intent_type or ASK_CLARIFICATION_INTENT
         condition_groups.append(
@@ -1100,8 +1355,8 @@ def build_selection_prompt(selection_text: str, schema_summary: str) -> str:
 /no_think
 너는 RDB raw 데이터 조회 조건을 구조화한다.
 추론 과정, 설명, markdown 없이 JSON 객체만 출력한다.
-사용자 표현이 부정확하면 아래 실시간 DB schema와 source_channel 후보를 기준으로 판단한다.
-현재 고객사는 환경별 기본 고객사만 있다.
+    사용자 표현이 부정확하면 아래 실시간 DB schema와 source_channel 후보를 기준으로 판단한다.
+    고객사, 계정, 캠페인, 매체 범위는 사용자 표현과 실시간 schema 후보에서만 판단한다.
 schema에 없는 table, column, source_channel을 임의로 만들지 않는다.
 
 실시간 DB schema 요약:
@@ -1226,6 +1481,9 @@ def parse_ir_with_llm(llm: Any, selection_text: str, modification_text: str, sch
     normalized = ensure_numeric_update_predicates(normalized, source_text)
     normalized = coerce_numeric_action_values(normalized, source_text)
     normalized = collapse_preview_only_detail_steps(normalized, source_text)
+    normalized = split_action_metric_groups(normalized, source_text)
+    normalized = recover_followup_aggregate_steps(normalized, source_text)
+    normalized = prune_unscoped_duplicate_aggregate_steps(normalized)
     normalized = split_mixed_media_aggregate_steps(normalized, source_text)
     normalized = recover_independent_read_only_steps(normalized, source_text)
     normalized = remove_media_scope_conditions(normalized)
@@ -1264,7 +1522,10 @@ def parse_ir_request_node(state: ModificationWorkflowState, llm: Any = None) -> 
     ir_structured_json = ensure_numeric_update_predicates(ir_structured_json, source_text)
     ir_structured_json = coerce_numeric_action_values(ir_structured_json, source_text)
     ir_structured_json = collapse_preview_only_detail_steps(ir_structured_json, source_text)
+    ir_structured_json = split_action_metric_groups(ir_structured_json, source_text)
     if not state.get("active_step_id"):
+        ir_structured_json = recover_followup_aggregate_steps(ir_structured_json, source_text)
+        ir_structured_json = prune_unscoped_duplicate_aggregate_steps(ir_structured_json)
         ir_structured_json = split_mixed_media_aggregate_steps(ir_structured_json, source_text)
         ir_structured_json = recover_independent_read_only_steps(ir_structured_json, source_text)
     ir_structured_json = remove_media_scope_conditions(ir_structured_json)

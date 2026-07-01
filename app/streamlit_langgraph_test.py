@@ -707,6 +707,7 @@ def effective_preview_context_for_step(
     overlay_columns: list[str] = []
     overlay_step_keys: list[str] = []
     derived_overlay_columns: list[str] = []
+    derived_scope_predicates: list[dict[str, Any]] = []
     for step in steps:
         prior_id = str(step.get("step_id") or step.get("group_id"))
         if prior_id not in accepted or step_order_for_id(steps, prior_id) >= current_order:
@@ -714,8 +715,27 @@ def effective_preview_context_for_step(
         if prior_id not in dependency_ancestors:
             continue
         overlay_step_keys.append(prior_id)
-        overlay_columns.extend(overlay_columns_from_result(previews.get(prior_id, {})))
-        for item in preview_delta_items_from_result(previews.get(prior_id, {})):
+        preview = previews.get(prior_id, {})
+        overlay_columns.extend(overlay_columns_from_result(preview))
+        output_query = preview.get("output_json", {}).get("query_from_ir", {}) if isinstance(preview, dict) else {}
+        candidate = preview.get("sql_candidate") or output_query if isinstance(preview, dict) else {}
+        precompiled_where = preview.get("precompiled_where", {}) if isinstance(preview, dict) else {}
+        where_sql = candidate.get("where_sql") or precompiled_where.get("sql")
+        where_params = candidate.get("where_params") or precompiled_where.get("params", [])
+        predicate = candidate.get("predicate") or precompiled_where.get("predicate", [])
+        referenced_columns = candidate.get("referenced_columns") or precompiled_where.get("columns", [])
+        if candidate.get("sql_type") == "INSERT" and where_sql and candidate.get("target_table"):
+            derived_scope_predicates.append(
+                {
+                    "step_key": prior_id,
+                    "target_table": candidate.get("target_table"),
+                    "where_sql": where_sql,
+                    "where_params": list(where_params),
+                    "columns": list(referenced_columns),
+                    "predicate": list(predicate),
+                }
+            )
+        for item in preview_delta_items_from_result(preview):
             if item.get("delta_type") == "preview_derived" and isinstance(item.get("after"), dict):
                 derived_overlay_columns.extend(str(column) for column in item["after"].keys())
     return {
@@ -724,6 +744,7 @@ def effective_preview_context_for_step(
         "overlay_columns": unique_preserve_order(overlay_columns),
         "overlay_step_keys": unique_preserve_order(overlay_step_keys),
         "derived_overlay_columns": unique_preserve_order(derived_overlay_columns),
+        "derived_scope_predicates": derived_scope_predicates,
     }
 
 

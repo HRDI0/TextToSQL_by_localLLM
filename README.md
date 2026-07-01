@@ -20,47 +20,65 @@ The public version intentionally avoids client names, production identifiers, ra
 ├── app/                         # Application and workflow code
 ├── scripts/                     # Local data-load and DB inspection CLIs
 ├── docs/public/                 # External-shareable documentation only
-├── compose.example.yaml         # Public Docker Compose template
+├── compose.yaml                 # Docker Compose stack for MariaDB and Streamlit
 ├── .env.example                 # Public environment template
-├── requirements-langgraph.txt   # Workflow/UI dependencies
-└── requirements-mariadb.txt     # Database client dependencies
+└── requirements.txt             # Python dependencies
 ```
 
 Internal documentation is ignored by default. Only files under `docs/public/` are intended for external sharing.
 
 ## Requirements
 
-- Python 3.x
 - Docker and Docker Compose
-- MariaDB, provided locally from `compose.example.yaml`
+- Optional: Python 3.x for running scripts outside Docker
 
 Use environment variables for database credentials and never commit local `.env` files.
 
 ```bash
-DB_HOST=127.0.0.1
-DB_PORT=3307
-DB_USER=<user>
-DB_PASSWORD=<password>
-DB_NAME=<database>
+SQL_WORKFLOW_DB_HOST=127.0.0.1
+SQL_WORKFLOW_DB_PORT=3307
+SQL_WORKFLOW_DB_USER=<user>
+SQL_WORKFLOW_DB_PASSWORD=<password>
+SQL_WORKFLOW_DB_NAME=<database>
 ```
 
-The application code may use project-specific environment variable names internally. For public documentation, keep real values and client-specific names out of committed files.
+Keep real values and client-specific names out of committed files.
 
-## Setup
+## Docker Setup
+
+```bash
+cp .env.example .env
+# Edit .env locally. Do not commit it.
+docker compose up --build
+```
+
+After a later update:
+
+```bash
+git pull
+docker compose up --build
+```
+
+The Docker stack starts MariaDB and the Streamlit app. For the current local
+workflow, use Gemini native mode in `.env` and fill one of the API key fields:
+
+```bash
+SQL_WORKFLOW_LLM_PROVIDER=gemini_native
+SQL_WORKFLOW_GEMINI_MODEL=gemini-3.1-flash-lite
+GOOGLE_API_KEY=
+GEMINI_API_KEY=
+```
+
+Leave unused key fields blank. A local model file is not shipped with the repository.
+Docker Compose passes these values from `.env` into the app container; you do
+not need to export API keys in your shell.
+
+For host-side Python utilities, optionally create a virtual environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -r requirements-langgraph.txt
-python3 -m pip install -r requirements-mariadb.txt
-```
-
-Prepare local templates, then start the local database service:
-
-```bash
-cp .env.example .env
-cp compose.example.yaml compose.yaml
-docker compose up -d mariadb
+python3 -m pip install -r requirements.txt
 ```
 
 ## Local Usage
@@ -77,17 +95,20 @@ python3 scripts/query_db.py sample --limit 10
 python3 scripts/query_db.py sql "SELECT COUNT(*) AS rows FROM <table_name>"
 ```
 
-Run the manual workflow UI:
+The Streamlit UI is exposed at `http://127.0.0.1:8501` by default. From the host,
+MariaDB is exposed at `127.0.0.1:3307`; inside Docker, the app uses `mariadb:3306`.
+
+Run the manual workflow UI directly on the host only if you installed local Python dependencies:
 
 ```bash
 bash scripts/run_streamlit.sh
 ```
 
-The UI first fixes the requested data scope, then applies follow-up conditions or calculations inside that scope. The default LLM connection is the local OpenAI-compatible llama.cpp endpoint; optional provider/model selection is available in the local admin controls without committing secrets.
+The UI first fixes the requested data scope, then applies follow-up conditions or calculations inside that scope. The LLM connection is configured through environment variables; optional provider/model selection is available in the local admin controls without committing secrets.
 
 ## Local LLM and Streamlit Launch
 
-The default local LLM path is an OpenAI-compatible llama.cpp server. Keep actual model paths, private endpoints, and hardware-specific settings in your ignored local `.env` or internal runbook.
+The optional local LLM path is an OpenAI-compatible llama.cpp server. Keep actual model paths, private endpoints, and hardware-specific settings in your ignored local `.env` or internal runbook.
 
 Minimum `.env` values for the main GPU server:
 
@@ -101,7 +122,7 @@ SQL_WORKFLOW_LLAMA_HOST=127.0.0.1
 SQL_WORKFLOW_LLAMA_PORT=8000
 ```
 
-Start the 14B llama.cpp GPU server:
+Start the optional llama.cpp server:
 
 ```bash
 nohup bash scripts/run_llama_cpp_server.sh >/dev/null 2>&1 &

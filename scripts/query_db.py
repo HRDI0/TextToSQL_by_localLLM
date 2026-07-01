@@ -5,9 +5,14 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
+from dotenv import load_dotenv  # type: ignore[reportMissingImports]
 import pymysql  # type: ignore[import-not-found]
+
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def env_value(name: str, default: str, *fallback_names: str) -> str:
@@ -22,11 +27,11 @@ def env_int(name: str, default: int) -> int:
     return int(env_value(name, str(default)))
 
 
-DEFAULT_DB_HOST = env_value("SQL_WORKFLOW_DB_HOST", "127.0.0.1", "KTM_DB_HOST")
-DEFAULT_DB_PORT = int(env_value("SQL_WORKFLOW_DB_PORT", "3307", "KTM_DB_PORT"))
-DEFAULT_DB_USER = env_value("SQL_WORKFLOW_DB_USER", "workflow_user", "KTM_DB_USER")
-DEFAULT_DB_PASSWORD = env_value("SQL_WORKFLOW_DB_PASSWORD", "", "KTM_DB_PASSWORD")
-DEFAULT_DB_NAME = env_value("SQL_WORKFLOW_DB_NAME", "approval_workflow", "KTM_DB_NAME")
+DEFAULT_DB_HOST = env_value("SQL_WORKFLOW_DB_HOST", "127.0.0.1")
+DEFAULT_DB_PORT = int(env_value("SQL_WORKFLOW_DB_PORT", "3307"))
+DEFAULT_DB_USER = env_value("SQL_WORKFLOW_DB_USER", "workflow_user")
+DEFAULT_DB_PASSWORD = env_value("SQL_WORKFLOW_DB_PASSWORD", "")
+DEFAULT_DB_NAME = env_value("SQL_WORKFLOW_DB_NAME", "approval_workflow")
 
 SUMMARY_TABLES = [
     "import_batch",
